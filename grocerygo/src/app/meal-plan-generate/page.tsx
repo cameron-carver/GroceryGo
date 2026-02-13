@@ -2,12 +2,16 @@ import { createClient } from '@/utils/supabase/server'
 import { redirect } from 'next/navigation'
 import MealPlanGenerateClient from './MealPlanGenerateClient'
 
-export default async function MealPlanGeneratePage() {
+export default async function MealPlanGeneratePage({
+  searchParams,
+}: {
+  searchParams: Promise<{ complexityMap?: string; weekScoreId?: string }>
+}) {
   const supabase = await createClient()
-  
+
   // Check authentication
   const { data: { user }, error: authError } = await supabase.auth.getUser()
-  
+
   if (authError || !user) {
     redirect('/login')
   }
@@ -23,5 +27,21 @@ export default async function MealPlanGeneratePage() {
     redirect('/onboarding')
   }
 
-  return <MealPlanGenerateClient />
+  const resolvedParams = await searchParams
+  let complexityMap: Record<string, string> | undefined
+  if (resolvedParams.complexityMap) {
+    try {
+      complexityMap = JSON.parse(resolvedParams.complexityMap)
+    } catch {
+      // Ignore invalid JSON
+    }
+  }
+
+  return (
+    <MealPlanGenerateClient
+      surveyResponse={userData.survey_response}
+      complexityMap={complexityMap}
+      weekScoreId={resolvedParams.weekScoreId}
+    />
+  )
 }

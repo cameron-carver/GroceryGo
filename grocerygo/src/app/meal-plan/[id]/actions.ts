@@ -2,63 +2,59 @@
 
 import { createClient } from '@/utils/supabase/server'
 import { revalidateTag } from 'next/cache'
-import type { GroceryItem, RecipeInsert, GroceryItemInsert, AIGeneratedMealPlan } from '@/types/database'
+import type {
+  GroceryItem,
+  RecipeInsert,
+  GroceryItemInsert,
+  AIGeneratedMealPlan
+} from '@/types/database'
 import type { ShoppingListData, InstacartResponse, LineItem } from '@/types/instacart'
-import { callOpenAI, callOpenAIStructured } from '@/app/actions/aiHelper'
+import { callOpenAI } from '@/app/actions/aiHelper'
 import { trackMealPlanAction } from '@/app/actions/feedbackHelper'
-import { 
+import {
   replaceRecipePrompt, 
   bulkAdjustmentPrompt, 
   simplifyRecipePrompt 
 } from './prompts'
-import { 
-  ReplaceRecipeSchema, 
-  SimplifyRecipeSchema, 
-  createMealPlanSchema 
-} from '@/app/schemas/mealPlanSchemas'
-import { getDateForMealIndex, getDateForScheduledMeal } from '@/utils/mealPlanDates'
 
 const INSTACART_API_URL = 'https://connect.dev.instacart.tools/idp/v1/products/products_link'
 const INSTACART_API_KEY = process.env.INSTACART_API_KEY
-const INSTACART_LINK_EXPIRATION_DAYS = 1 // Instacart links expire after 1 day (24 hours)
+
+type AdditionalGroceryItem = {
+  item: string
+  quantity: string
+}
+
+type ReplacementRecipePayload = {
+  recipe: {
+    name: string
+    ingredients: RecipeInsert['ingredients']
+    steps: string[]
+  }
+  additional_grocery_items?: AdditionalGroceryItem[]
+}
+
+type RecipeIngredient = {
+  item: string
+  quantity: string
+  unit?: string
+  [key: string]: unknown
+}
+
+type SimplifiedRecipe = {
+  name: string
+  ingredients: RecipeInsert['ingredients']
+  steps: string[]
+}
 
 export async function createInstacartOrder(
   groceryItems: GroceryItem[],
-  mealPlanId: string,
   mealPlanTitle: string,
   mealPlanUrl: string
 ): Promise<{ success: boolean; link?: string; error?: string }> {
   try {
     if (!INSTACART_API_KEY) {
       throw new Error('Instacart API key is not configured')
-    }
-
-    const supabase = await createClient()
-
-    // Check for cached link
-    const { data: mealPlan, error: fetchError } = await supabase
-      .from('meal_plans')
-      .select('instacart_link, instacart_link_expires_at')
-      .eq('id', mealPlanId)
-      .single()
-
-    if (fetchError) {
-      console.error('Error fetching meal plan for cache check:', fetchError)
-      // Continue to generate new link even if cache check fails
-    }
-
-    // If we have a cached link and it hasn't expired, return it
-    if (mealPlan?.instacart_link && mealPlan?.instacart_link_expires_at) {
-      const expiresAt = new Date(mealPlan.instacart_link_expires_at)
-      const now = new Date()
-      
-      // Check if link is still valid (with 1 hour buffer for safety)
-      if (expiresAt.getTime() > now.getTime() + (60 * 60 * 1000)) {
-        return {
-          success: true,
-          link: mealPlan.instacart_link
-        }
-      }
     }
 
     // Convert grocery items to Instacart line items
@@ -88,7 +84,7 @@ export async function createInstacartOrder(
     const shoppingListData: ShoppingListData = {
       title: mealPlanTitle,
       link_type: 'shopping_list',
-      expires_in: INSTACART_LINK_EXPIRATION_DAYS,
+      expires_in: 1, // 1 day (Instacart expects days, not seconds)
       instructions: [
         'These ingredients are for your weekly meal plan from GroceryGo',
         'Feel free to adjust quantities based on your preferences'
@@ -122,24 +118,6 @@ export async function createInstacartOrder(
     }
 
     const data: InstacartResponse = await response.json()
-    
-    // Cache the link in the database
-    const expiresAt = data.expires_at 
-      ? new Date(data.expires_at)
-      : new Date(Date.now() + INSTACART_LINK_EXPIRATION_DAYS * 24 * 60 * 60 * 1000) // Default to configured expiration time
-
-    const { error: updateError } = await supabase
-      .from('meal_plans')
-      .update({
-        instacart_link: data.products_link_url,
-        instacart_link_expires_at: expiresAt.toISOString()
-      })
-      .eq('id', mealPlanId)
-
-    if (updateError) {
-      console.error('Error caching Instacart link:', updateError)
-      // Don't fail the request if caching fails - still return the link
-    }
     
     return {
       success: true,
@@ -197,7 +175,7 @@ export async function replaceRecipe(
     // Get existing ingredients to maximize reuse
     const existingIngredients = mealPlan.grocery_items.map((item: GroceryItem) => item.item_name)
 
-    // Call AI to generate replacement recipe with structured output
+    // Call AI to generate replacement recipe
     const prompt = replaceRecipePrompt(
       mealPlan.survey_snapshot || {},
       mealType,
@@ -205,11 +183,14 @@ export async function replaceRecipe(
       oldRecipe.name
     )
 
-    const result = await callOpenAIStructured(
-      'You are an expert meal planner for GroceryGo. Generate a single replacement recipe following all guidelines.',
+    const result = await callOpenAI<ReplacementRecipePayload>(
+      'You are an expert meal planner for GroceryGo. Generate a single replacement recipe in JSON format following all guidelines.',
       prompt,
-      ReplaceRecipeSchema,
-      'replace_recipe_response'
+      (response) => {
+        const jsonMatch = response.match(/```json\n?([\s\S]*?)\n?```/) || response.match(/```\n?([\s\S]*?)\n?```/)
+        const jsonStr = jsonMatch ? jsonMatch[1] : response
+        return JSON.parse(jsonStr)
+      }
     )
 
     if (!result.success || !result.data) {
@@ -244,7 +225,7 @@ export async function replaceRecipe(
 
     // Add new grocery items
     if (additional_grocery_items && additional_grocery_items.length > 0) {
-      const newGroceryItems: GroceryItemInsert[] = additional_grocery_items.map((item: any) => ({
+      const newGroceryItems: GroceryItemInsert[] = additional_grocery_items.map((item) => ({
         meal_plan_id: mealPlanId,
         item_name: item.item,
         quantity: parseQuantity(item.quantity),
@@ -322,18 +303,14 @@ export async function regenerateWithAdjustments(
       mealBreakdown
     )
 
-    // Create dynamic schema with exact recipe counts
-    const mealPlanSchema = createMealPlanSchema(
-      mealBreakdown.breakfast,
-      mealBreakdown.lunch,
-      mealBreakdown.dinner
-    )
-
-    const result = await callOpenAIStructured(
-      'You are an expert meal planner for GroceryGo. Generate a complete meal plan with optimizations.',
+    const result = await callOpenAI<AIGeneratedMealPlan>(
+      'You are an expert meal planner for GroceryGo. Generate a complete meal plan with optimizations in JSON format.',
       prompt,
-      mealPlanSchema,
-      'meal_plan_response'
+      (response) => {
+        const jsonMatch = response.match(/```json\n?([\s\S]*?)\n?```/) || response.match(/```\n?([\s\S]*?)\n?```/)
+        const jsonStr = jsonMatch ? jsonMatch[1] : response
+        return JSON.parse(jsonStr)
+      }
     )
 
     if (!result.success || !result.data) {
@@ -341,13 +318,6 @@ export async function regenerateWithAdjustments(
     }
 
     const aiMealPlan = result.data
-
-    // Merge breakfast, lunch, and dinner arrays into single recipes array
-    const allRecipes = [
-      ...(aiMealPlan.breakfast || []),
-      ...(aiMealPlan.lunch || []),
-      ...(aiMealPlan.dinner || [])
-    ]
 
     // Delete existing recipes and grocery items
     await supabase
@@ -362,7 +332,8 @@ export async function regenerateWithAdjustments(
 
     // Create new recipes
     const recipeIds: string[] = []
-    for (const aiRecipe of allRecipes) {
+    const recipeIdMap: Record<string, string> = {}
+    for (const aiRecipe of aiMealPlan.recipes) {
       const { data: newRecipe } = await supabase
         .from('recipes')
         .insert({
@@ -377,25 +348,51 @@ export async function regenerateWithAdjustments(
 
       if (newRecipe) {
         recipeIds.push(newRecipe.id)
+        if (aiRecipe.id) {
+          recipeIdMap[aiRecipe.id] = newRecipe.id
+        }
       }
     }
 
-    // Link recipes to meal plan with dates from schedule
-    const mealSchedule = mealPlan.survey_snapshot?.meal_schedule || []
-    
-    const mealPlanRecipes = recipeIds.map((recipeId, index) => {
-      // Use the schedule if available, otherwise fall back to old method
-      const scheduleEntry = mealSchedule[index]
-      
-      return {
-        meal_plan_id: mealPlanId,
-        recipe_id: recipeId,
-        planned_for_date: scheduleEntry 
-          ? getDateForScheduledMeal(mealPlan.week_of, scheduleEntry.day)
-          : getDateForMealIndex(mealPlan.week_of, index),
-        meal_type: scheduleEntry?.mealType || allRecipes[index].mealType
-      }
-    })
+    const scheduleEntries = aiMealPlan.schedule && Array.isArray(aiMealPlan.schedule)
+      ? aiMealPlan.schedule
+      : []
+
+    const mealPlanRecipes = scheduleEntries.length > 0
+      ? scheduleEntries.reduce<{
+          inserts: {
+            meal_plan_id: string
+            recipe_id: string
+            planned_for_date?: string
+            meal_type?: 'breakfast' | 'lunch' | 'dinner'
+            portion_multiplier?: number
+            slot_label?: string
+          }[]
+          missingRecipeRefs: string[]
+        }>((acc, entry) => {
+          const linkedRecipeId = recipeIdMap[entry.recipeId]
+          if (!linkedRecipeId) {
+            acc.missingRecipeRefs.push(entry.recipeId)
+            return acc
+          }
+
+          const mealType = entry.mealType?.toLowerCase() as 'breakfast' | 'lunch' | 'dinner' | undefined
+          acc.inserts.push({
+            meal_plan_id: mealPlanId,
+            recipe_id: linkedRecipeId,
+            planned_for_date: getDateForDayName(mealPlan.week_of, entry.day),
+            meal_type: mealType,
+            portion_multiplier: entry.portionMultiplier || 1,
+            slot_label: entry.slotLabel || `${entry.day} ${entry.mealType}`
+          })
+          return acc
+        }, { inserts: [], missingRecipeRefs: [] }).inserts
+      : recipeIds.map((recipeId, index) => ({
+          meal_plan_id: mealPlanId,
+          recipe_id: recipeId,
+          planned_for_date: getDateForMealIndex(mealPlan.week_of, index),
+          portion_multiplier: 1
+        }))
 
     await supabase
       .from('meal_plan_recipes')
@@ -431,7 +428,10 @@ export async function regenerateWithAdjustments(
 
     await supabase
       .from('meal_plans')
-      .update({ survey_snapshot: updatedSnapshot })
+      .update({
+        survey_snapshot: updatedSnapshot,
+        total_meals: scheduleEntries.length > 0 ? scheduleEntries.length : recipeIds.length
+      })
       .eq('id', mealPlanId)
 
     // Track action for feedback
@@ -485,11 +485,12 @@ export async function scaleRecipeServings(
     }
 
     // Scale ingredients
-    const scaledIngredients = recipe.ingredients.map((ing: any) => {
-      const quantity = parseFloat(ing.quantity) || 1
+    const ingredients = (recipe.ingredients ?? []) as RecipeIngredient[]
+    const scaledIngredients = ingredients.map((ingredient) => {
+      const quantity = parseFloat(String(ingredient.quantity)) || 1
       const scaledQuantity = quantity * multiplier
       return {
-        ...ing,
+        ...ingredient,
         quantity: scaledQuantity.toString()
       }
     })
@@ -549,14 +550,15 @@ export async function swapIngredient(
     }
 
     // Update ingredients
-    const updatedIngredients = recipe.ingredients.map((ing: any) => {
-      if (ing.item.toLowerCase().includes(oldIngredient.toLowerCase())) {
+    const ingredients = (recipe.ingredients ?? []) as RecipeIngredient[]
+    const updatedIngredients = ingredients.map((ingredient) => {
+      if (ingredient.item.toLowerCase().includes(oldIngredient.toLowerCase())) {
         return {
-          ...ing,
+          ...ingredient,
           item: newIngredient
         }
       }
-      return ing
+      return ingredient
     })
 
     await supabase
@@ -586,7 +588,7 @@ export async function swapIngredient(
 export async function simplifyRecipe(
   mealPlanId: string,
   recipeId: string
-): Promise<{ success: boolean; error?: string; simplifiedRecipe?: any }> {
+): Promise<{ success: boolean; error?: string; simplifiedRecipe?: SimplifiedRecipe }> {
   try {
     const supabase = await createClient()
 
@@ -607,18 +609,21 @@ export async function simplifyRecipe(
       return { success: false, error: 'Recipe not found' }
     }
 
-    // Call AI to simplify with structured output
+    // Call AI to simplify
     const prompt = simplifyRecipePrompt(
       recipe.name,
       recipe.ingredients,
       recipe.steps
     )
 
-    const result = await callOpenAIStructured(
-      'You are a culinary expert helping busy people simplify recipes.',
+    const result = await callOpenAI<{ simplified_recipe: SimplifiedRecipe }>(
+      'You are a culinary expert helping busy people simplify recipes. Provide simplified versions in JSON format.',
       prompt,
-      SimplifyRecipeSchema,
-      'simplify_recipe_response'
+      (response) => {
+        const jsonMatch = response.match(/```json\n?([\s\S]*?)\n?```/) || response.match(/```\n?([\s\S]*?)\n?```/)
+        const jsonStr = jsonMatch ? jsonMatch[1] : response
+        return JSON.parse(jsonStr)
+      }
     )
 
     if (!result.success || !result.data) {
@@ -628,11 +633,12 @@ export async function simplifyRecipe(
     const { simplified_recipe } = result.data
 
     // Update recipe with simplified version
+    const simplifiedIngredients = (simplified_recipe.ingredients ?? []) as RecipeIngredient[]
     await supabase
       .from('recipes')
       .update({
         name: simplified_recipe.name,
-        ingredients: simplified_recipe.ingredients,
+        ingredients: simplifiedIngredients,
         steps: simplified_recipe.steps
       })
       .eq('id', recipeId)
@@ -654,6 +660,48 @@ export async function simplifyRecipe(
 }
 
 // Helper functions
+function getDateForMealIndex(weekOf: string, index: number): string {
+  const startDate = new Date(weekOf)
+  const dayOffset = index % 7
+  const mealDate = new Date(startDate)
+  mealDate.setDate(startDate.getDate() + dayOffset)
+  return mealDate.toISOString().split('T')[0]
+}
+
+function getDateForDayName(weekOf: string, dayName?: string): string | undefined {
+  if (!dayName) return undefined
+
+  const normalizedDay = dayName.trim().toLowerCase()
+  const dayMap: Record<string, number> = {
+    sunday: 0,
+    monday: 1,
+    tuesday: 2,
+    wednesday: 3,
+    thursday: 4,
+    friday: 5,
+    saturday: 6
+  }
+
+  const targetOffset = dayMap[normalizedDay]
+
+  if (targetOffset === undefined) {
+    return undefined
+  }
+
+  const startDate = new Date(weekOf)
+  if (Number.isNaN(startDate.getTime())) {
+    return undefined
+  }
+
+  const startDayIndex = dayMap[startDate.toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase()] ?? 1
+  const offset = targetOffset - startDayIndex
+
+  const mealDate = new Date(startDate)
+  mealDate.setDate(startDate.getDate() + offset)
+
+  return mealDate.toISOString().split('T')[0]
+}
+
 function parseQuantity(quantityStr: string): number | undefined {
   const match = quantityStr.match(/^([\d.]+)/)
   return match ? parseFloat(match[1]) : undefined

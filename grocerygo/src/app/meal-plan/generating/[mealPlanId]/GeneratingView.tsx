@@ -4,15 +4,31 @@ import { useEffect, useState, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import RecipeCardSkeleton from '@/components/RecipeCardSkeleton'
 import { saveGeneratedRecipes } from '../actions'
+import type { SurveyResponse } from '@/types/database'
+
+type SurveySnapshotData = SurveyResponse & {
+  meal_selection?: {
+    breakfast: number
+    lunch: number
+    dinner: number
+  }
+  distinct_recipe_counts?: {
+    breakfast: number
+    lunch: number
+    dinner: number
+  }
+  selected_slots?: SelectedSlot[]
+}
 
 interface GeneratingViewProps {
   mealPlanId: string
   weekOf: string
   totalMeals: number
-  surveySnapshot?: Record<string, any>
+  surveySnapshot?: SurveySnapshotData
 }
 
 interface RecipeData {
+  id?: string
   name: string
   mealType?: string
   ingredients: Array<{
@@ -37,9 +53,31 @@ interface RecipeData {
   }
 }
 
-interface GroceryListItem {
-  item: string
-  quantity: string
+interface SelectedSlot {
+  day: string
+  mealType: string
+}
+
+interface ScheduleEntry {
+  slotLabel: string
+  day: string
+  mealType: string
+  recipeId: string
+  portionMultiplier: number
+}
+
+function getScheduledDay(weekOf: string, index: number) {
+  const startDate = new Date(weekOf)
+  if (Number.isNaN(startDate.getTime())) {
+    return 'Unscheduled'
+  }
+
+  const mealDate = new Date(startDate)
+  mealDate.setDate(startDate.getDate() + (index % 7))
+
+  return mealDate.toLocaleDateString('en-US', {
+    weekday: 'long'
+  })
 }
 
 export default function GeneratingView({
@@ -52,20 +90,14 @@ export default function GeneratingView({
   const [recipes, setRecipes] = useState<(RecipeData | null)[]>(
     Array(totalMeals).fill(null)
   )
-  const [groceryList, setGroceryList] = useState<GroceryListItem[]>([])
   const [currentRecipeIndex, setCurrentRecipeIndex] = useState(0)
-  const [isComplete, setIsComplete] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [streamBuffer, setStreamBuffer] = useState('')
-  
-  // Use ref to track the actual count to prevent flickering
+
   const recipeCountRef = useRef(0)
-  // Track if generation has started to prevent double execution in Strict Mode
   const hasStartedGenerationRef = useRef(false)
 
   useEffect(() => {
-    // Only run once, even in Strict Mode
     if (!hasStartedGenerationRef.current) {
       hasStartedGenerationRef.current = true
       generateMealPlan()
@@ -75,143 +107,151 @@ export default function GeneratingView({
 
   const tryParsePartialRecipes = (buffer: string) => {
     try {
-      // Extract JSON from markdown if present
       let jsonContent = buffer
       const jsonMatch = buffer.match(/```json\s*([\s\S]*?)(?:```|$)/)
       if (jsonMatch) {
         jsonContent = jsonMatch[1]
       }
 
-      // Try to extract recipes from breakfast, lunch, and dinner arrays
-      const allRecipeObjects: string[] = []
-      
-      // Extract each meal type array
-      for (const mealType of ['breakfast', 'lunch', 'dinner']) {
-        const arrayMatch = jsonContent.match(new RegExp(`"${mealType}"\\s*:\\s*\\[([\\s\\S]*?)(?:\\]|$)`))
-        if (!arrayMatch) continue
-        
-        let recipesContent = arrayMatch[1]
-        
-        // Parse recipe objects from this array
-        let depth = 0
-        let inString = false
-        let escapeNext = false
-        let currentObj = ''
-        let inRecipeObject = false
-        
-        for (let i = 0; i < recipesContent.length; i++) {
-          const char = recipesContent[i]
-          
-          if (escapeNext) {
-            escapeNext = false
-            currentObj += char
-            continue
-          }
-          
-          if (char === '\\') {
-            escapeNext = true
-            currentObj += char
-            continue
-          }
-          
-          if (char === '"') {
-            inString = !inString
-            currentObj += char
-            continue
-          }
-          
-          if (inString) {
-            currentObj += char
-            continue
-          }
-          
-          if (char === '{') {
-            depth++
-            if (depth === 1) {
-              inRecipeObject = true
-              currentObj = '{'
-            } else {
-              currentObj += char
-            }
-          } else if (char === '}') {
-            currentObj += char
-            depth--
-            if (depth === 0 && inRecipeObject) {
-              // Complete recipe object
-              allRecipeObjects.push(currentObj)
-              currentObj = ''
-              inRecipeObject = false
-            }
-          } else if (inRecipeObject) {
+      const recipesMatch = jsonContent.match(/"recipes"\s*:\s*\[([\s\S]*)/)
+      if (!recipesMatch) return
+
+      const recipesContent = recipesMatch[1]
+      let depth = 0
+      let inString = false
+      let escapeNext = false
+      const recipeObjects: string[] = []
+      let currentObj = ''
+      let inRecipeObject = false
+
+      for (let i = 0; i < recipesContent.length; i++) {
+        const char = recipesContent[i]
+
+        if (escapeNext) {
+          escapeNext = false
+          currentObj += char
+          continue
+        }
+
+        if (char === '\\') {
+          escapeNext = true
+          currentObj += char
+          continue
+        }
+
+        if (char === '"') {
+          inString = !inString
+          currentObj += char
+          continue
+        }
+
+        if (inString) {
+          currentObj += char
+          continue
+        }
+
+        if (char === '{') {
+          depth += 1
+          if (depth === 1) {
+            inRecipeObject = true
+            currentObj = '{'
+          } else {
             currentObj += char
           }
+        } else if (char === '}') {
+          currentObj += char
+          depth -= 1
+          if (depth === 0 && inRecipeObject) {
+            recipeObjects.push(currentObj)
+            currentObj = ''
+            inRecipeObject = false
+          }
+        } else if (inRecipeObject) {
+          currentObj += char
         }
       }
-      
-      // Parse complete recipe objects - ONLY parse new ones beyond current index
-      if (allRecipeObjects.length > recipeCountRef.current) {
-        // Only parse the NEW recipes we haven't seen yet
-        const newRecipeObjects = allRecipeObjects.slice(recipeCountRef.current)
+
+      if (recipeObjects.length > recipeCountRef.current) {
+        const newRecipeObjects = recipeObjects.slice(recipeCountRef.current)
         const newParsedRecipes: RecipeData[] = []
-        
+
         for (const recipeStr of newRecipeObjects) {
           try {
-            const recipe = JSON.parse(recipeStr)
+            const recipe = JSON.parse(recipeStr) as RecipeData
             if (recipe.name && recipe.ingredients && recipe.steps) {
               newParsedRecipes.push(recipe)
             }
-          } catch (e) {
-            // Skip malformed recipes - this is expected during streaming
-            break // Stop parsing if we hit an incomplete recipe
+          } catch {
+            break
           }
         }
-        
+
         if (newParsedRecipes.length > 0) {
-          // Add ONLY the new recipes, don't touch existing ones
           const startIndex = recipeCountRef.current
-          setRecipes(prev => {
-            const newRecipes = [...prev]
-            for (let i = 0; i < newParsedRecipes.length; i++) {
-              const index = startIndex + i
-              if (index < totalMeals && newRecipes[index] === null) {
-                newRecipes[index] = newParsedRecipes[i]
+          setRecipes((prev) => {
+            const next = [...prev]
+            newParsedRecipes.forEach((recipe, idx) => {
+              const index = startIndex + idx
+              if (index < totalMeals && next[index] === null) {
+                next[index] = recipe
               }
-            }
-            return newRecipes
+            })
+            return next
           })
-          
-          // Update ref first, then state (prevents flickering)
+
           recipeCountRef.current = startIndex + newParsedRecipes.length
           setCurrentRecipeIndex(recipeCountRef.current)
         }
       }
-    } catch (e) {
-      // Silently fail - this is expected during streaming
+    } catch {
+      // ignore partial parse errors during streaming
     }
   }
 
   const generateMealPlan = async () => {
     try {
-      // TODO: HAVE THIS MATCH THE EXACT MEAL TYPES FROM THE SURVEY
       const mealSelection = surveySnapshot?.meal_selection || {
         breakfast: Math.floor(totalMeals / 3),
         lunch: Math.floor(totalMeals / 3),
-        dinner: totalMeals - (2 * Math.floor(totalMeals / 3))
+        dinner: totalMeals - 2 * Math.floor(totalMeals / 3)
       }
 
-      const mealSchedule = surveySnapshot?.meal_schedule || []
+      const distinctRecipeCounts = surveySnapshot?.distinct_recipe_counts || mealSelection
+
+      const selectedSlots: SelectedSlot[] =
+        surveySnapshot?.selected_slots ||
+        Array.from({ length: mealSelection.breakfast }, (_, idx) => ({
+          day: getScheduledDay(weekOf, idx),
+          mealType: 'breakfast'
+        }))
+          .concat(
+            Array.from({ length: mealSelection.lunch }, (_, idx) => ({
+              day: getScheduledDay(weekOf, mealSelection.breakfast + idx),
+              mealType: 'lunch'
+            }))
+          )
+          .concat(
+            Array.from({ length: mealSelection.dinner }, (_, idx) => ({
+              day: getScheduledDay(
+                weekOf,
+                mealSelection.breakfast + mealSelection.lunch + idx
+              ),
+              mealType: 'dinner'
+            }))
+          )
 
       const response = await fetch('/api/generate-meal-plan', {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({
           weekOf,
           mealSelection,
-          mealSchedule,
-          mealPlanId
-        }),
+          mealPlanId,
+          distinctRecipeCounts,
+          selectedSlots
+        })
       })
 
       if (!response.ok) {
@@ -229,26 +269,17 @@ export default function GeneratingView({
 
       while (true) {
         const { done, value } = await reader.read()
-        
         if (done) break
 
         const chunk = decoder.decode(value, { stream: true })
-        
-        // AI SDK text stream is just plain text, not in a special format
         buffer += chunk
-        setStreamBuffer(buffer)
-        
-        // Try to parse partial JSON to show recipes as they complete
         tryParsePartialRecipes(buffer)
       }
 
-      // Parse the complete response
       await parseCompleteResponse(buffer)
-      setIsComplete(true)
-
-    } catch (err: any) {
+    } catch (err) {
       console.error('Generation error:', err)
-      setError(err.message || 'Failed to generate meal plan')
+      setError(err instanceof Error ? err.message : 'Failed to generate meal plan')
     }
   }
 
@@ -259,36 +290,45 @@ export default function GeneratingView({
         return
       }
 
-      // Extract JSON from markdown code blocks if present
       const jsonMatch = buffer.match(/```json\n?([\s\S]*?)\n?```/) || buffer.match(/```\n?([\s\S]*?)\n?```/)
       const jsonStr = jsonMatch ? jsonMatch[1] : buffer
-      
-      const aiResponse = JSON.parse(jsonStr.trim())
-
-      // Merge breakfast, lunch, and dinner arrays into single recipes array
-      const allRecipes: RecipeData[] = []
-      
-      if (aiResponse.breakfast && Array.isArray(aiResponse.breakfast)) {
-        allRecipes.push(...aiResponse.breakfast)
-      }
-      if (aiResponse.lunch && Array.isArray(aiResponse.lunch)) {
-        allRecipes.push(...aiResponse.lunch)
-      }
-      if (aiResponse.dinner && Array.isArray(aiResponse.dinner)) {
-        allRecipes.push(...aiResponse.dinner)
+      const aiResponse = JSON.parse(jsonStr.trim()) as {
+        recipes?: RecipeData[]
+        grocery_list?: Array<{ item: string; quantity: string }>
+        schedule?: ScheduleEntry[]
       }
 
-      if (allRecipes.length > 0) {
-        setRecipes(allRecipes)
-        setCurrentRecipeIndex(allRecipes.length)
+      if (!Array.isArray(aiResponse.schedule)) {
+        setError('Meal plan generation did not include schedule details. Please try again.')
+        return
       }
 
-      if (aiResponse.grocery_list && Array.isArray(aiResponse.grocery_list)) {
-        setGroceryList(aiResponse.grocery_list)
+      if (aiResponse.schedule.length !== totalMeals) {
+        setError(`Meal plan schedule mismatch. Expected ${totalMeals} slots, received ${aiResponse.schedule.length}.`)
+        return
       }
 
-      // Auto-save after parsing
-      await saveRecipes(allRecipes, aiResponse.grocery_list)
+      const parsedSchedule = aiResponse.schedule as ScheduleEntry[]
+      const parsedRecipes = Array.isArray(aiResponse.recipes) ? aiResponse.recipes : []
+
+      if (!parsedRecipes.length) {
+        setError('Meal plan generation did not include any recipes. Please try again.')
+        return
+      }
+
+      if (parsedRecipes.length < parsedSchedule.length) {
+        setError(
+          `Meal plan generation returned ${parsedRecipes.length} recipes but ${parsedSchedule.length} scheduled meals. Please try again.`
+        )
+        return
+      }
+
+      setRecipes(parsedRecipes)
+      setCurrentRecipeIndex(parsedRecipes.length)
+
+      const groceryListItems = Array.isArray(aiResponse.grocery_list) ? aiResponse.grocery_list : []
+
+      await saveRecipes(parsedRecipes, groceryListItems, parsedSchedule)
     } catch (err) {
       console.error('Parse error:', err)
       console.error('Buffer content:', buffer)
@@ -297,18 +337,22 @@ export default function GeneratingView({
     }
   }
 
-  const saveRecipes = async (recipesToSave: RecipeData[], groceryListToSave: GroceryListItem[]) => {
+  const saveRecipes = async (
+    recipesToSave: RecipeData[],
+    groceryListToSave: Array<{ item: string; quantity: string }>,
+    schedule: ScheduleEntry[]
+  ) => {
     setIsSaving(true)
-    
+
     try {
       const result = await saveGeneratedRecipes(
         mealPlanId,
         recipesToSave,
-        groceryListToSave
+        groceryListToSave,
+        schedule
       )
 
       if (result.success) {
-        // Wait a moment for the animation, then redirect
         setTimeout(() => {
           router.push(`/meal-plan/${mealPlanId}`)
         }, 1500)
@@ -316,16 +360,15 @@ export default function GeneratingView({
         setError(result.error || 'Failed to save recipes')
         setIsSaving(false)
       }
-    } catch (err: any) {
+    } catch (err) {
       console.error('Save error:', err)
-      setError(err.message || 'Failed to save recipes')
+      setError(err instanceof Error ? err.message : 'Failed to save recipes')
       setIsSaving(false)
     }
   }
 
   return (
     <div className="gg-bg-page min-h-screen relative">
-      {/* Loading Overlay */}
       <div className="fixed inset-0 bg-white/40 backdrop-blur-[2px] z-40 flex items-center justify-center">
         <div className="text-center">
           <div className="mb-6">
@@ -335,15 +378,13 @@ export default function GeneratingView({
             {isSaving ? 'Saving Your Meal Plan...' : 'Generating Your Personalized Meal Plan'}
           </h2>
           <p className="text-gray-600 mb-4">
-            {isSaving 
+            {isSaving
               ? 'Almost done! Finalizing your recipes and grocery list...'
-              : `Creating ${currentRecipeIndex} of ${totalMeals} recipes...`
-            }
+              : `Creating ${currentRecipeIndex} of ${totalMeals} recipes...`}
           </p>
-          
-          {/* Progress Bar */}
+
           <div className="w-80 mx-auto bg-gray-200 rounded-full h-2.5 mb-4">
-            <div 
+            <div
               className="bg-[var(--gg-primary)] h-2.5 rounded-full transition-all duration-300"
               style={{ width: `${(currentRecipeIndex / totalMeals) * 100}%` }}
             ></div>
@@ -357,7 +398,6 @@ export default function GeneratingView({
         </div>
       </div>
 
-      {/* Recipe Cards (Behind Overlay) */}
       <div className="gg-container">
         <div className="gg-section">
           <div className="mb-8">
@@ -367,15 +407,14 @@ export default function GeneratingView({
 
           <div className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
             {recipes.map((recipe, index) => (
-              <div 
-                key={index} 
+              <div
+                key={index}
                 className={`transition-all duration-500 ${
                   recipe ? 'opacity-100 scale-100' : 'opacity-0 scale-95'
                 }`}
               >
                 {recipe ? (
                   <div className="rounded-xl border-2 border-gray-200 bg-white p-6 hover:border-[var(--gg-primary)] hover:shadow-md transition-all animate-in fade-in slide-in-from-bottom-4 duration-500">
-                    {/* Recipe Header */}
                     <div className="mb-4">
                       <h3 className="gg-heading-card mb-2">{recipe.name}</h3>
                       {recipe.mealType && (
@@ -385,7 +424,6 @@ export default function GeneratingView({
                       )}
                     </div>
 
-                    {/* Meta Info */}
                     <div className="mb-4 flex flex-wrap gap-3 text-sm text-gray-600">
                       {recipe.prep_time_minutes && (
                         <span className="flex items-center gap-1">
@@ -398,24 +436,20 @@ export default function GeneratingView({
                       {recipe.servings && (
                         <span className="flex items-center gap-1">
                           <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0zM7 10a2 2 0 11-4 0 2 2 0z" />
                           </svg>
                           {recipe.servings} servings
                         </span>
                       )}
-                      {recipe.difficulty && (
-                        <span className="capitalize">{recipe.difficulty}</span>
-                      )}
                     </div>
 
-                    {/* Ingredients Preview */}
                     <div>
                       <p className="mb-2 text-xs font-semibold text-gray-700">Ingredients:</p>
                       <ul className="space-y-1 text-sm text-gray-600">
-                        {recipe.ingredients.slice(0, 3).map((ing, idx) => (
+                        {recipe.ingredients.slice(0, 3).map((ingredient, idx) => (
                           <li key={idx} className="flex items-start gap-2">
                             <span className="text-[var(--gg-primary)]">•</span>
-                            <span className="truncate">{ing.item}</span>
+                            <span className="truncate">{ingredient.item}</span>
                           </li>
                         ))}
                         {recipe.ingredients.length > 3 && (

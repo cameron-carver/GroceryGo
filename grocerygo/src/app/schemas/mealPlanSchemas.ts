@@ -22,7 +22,8 @@ export const RecipeSchema = z.object({
 // Grocery item schema
 export const GroceryItemSchema = z.object({
   item: z.string().min(1).describe('Ingredient name'),
-  quantity: z.string().min(1).describe('Total quantity with unit')
+  quantity: z.string().min(1).describe('Total quantity with unit'),
+  category: z.string().optional().describe('Grocery category for shelf life tracking'),
 })
 
 /**

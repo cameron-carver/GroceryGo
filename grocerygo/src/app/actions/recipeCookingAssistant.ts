@@ -209,11 +209,14 @@ Remember: ONLY answer if this question is about cooking this specific recipe. If
       data: result.data
     }
 
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error('Recipe cooking assistant error:', error)
     return {
       success: false,
-      error: 'An unexpected error occurred. Please try again.'
+      error:
+        error instanceof Error
+          ? `An unexpected error occurred: ${error.message}`
+          : 'An unexpected error occurred. Please try again.'
     }
   }
 }

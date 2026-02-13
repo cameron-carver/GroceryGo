@@ -2,7 +2,7 @@
 
 import { useState } from 'react'
 import Link from 'next/link'
-import type { MealPlanWithRecipes, Recipe } from '@/types/database'
+import type { MealPlanWithRecipes, Recipe, MealPlanRecipe } from '@/types/database'
 import RecipeModal from '@/components/RecipeModal'
 import RecipeCardActions from '@/components/RecipeCardActions'
 import AdjustPlanPanel from '@/components/AdjustPlanPanel'
@@ -30,6 +30,7 @@ export default function MealPlanView({ mealPlan, savedRecipeIds }: MealPlanViewP
   const [activeTab, setActiveTab] = useState<'recipes' | 'shopping'>('recipes')
   const [checkedItems, setCheckedItems] = useState<Set<string>>(new Set())
   const [selectedRecipe, setSelectedRecipe] = useState<Recipe | null>(null)
+  const [selectedRecipeSlots, setSelectedRecipeSlots] = useState<MealPlanRecipe[]>([])
   const [isOrderingInstacart, setIsOrderingInstacart] = useState(false)
   const [instacartError, setInstacartError] = useState<string | null>(null)
   
@@ -52,14 +53,14 @@ export default function MealPlanView({ mealPlan, savedRecipeIds }: MealPlanViewP
   }
 
   // Handler functions for new features
-  const handleReplaceRecipe = async (recipeId: string) => {
+  const handleReplaceRecipe = async (recipeId: string, suggestedMealType?: string | null) => {
     setIsProcessing(true)
     setActionError(null)
     
     try {
       // Find the meal type for this recipe
       const mealPlanRecipe = mealPlan.meal_plan_recipes.find(mpr => mpr.recipe_id === recipeId)
-      const mealType = mealPlanRecipe?.meal_type || 'dinner'
+      const mealType = suggestedMealType || mealPlanRecipe?.meal_type || 'dinner'
       
       const result = await replaceRecipe(mealPlan.id, recipeId, mealType)
       
@@ -279,7 +280,6 @@ export default function MealPlanView({ mealPlan, savedRecipeIds }: MealPlanViewP
       
       const result = await createInstacartOrder(
         uncheckedItems,
-        mealPlan.id,
         mealPlanTitle,
         mealPlanUrl
       )
@@ -326,42 +326,60 @@ export default function MealPlanView({ mealPlan, savedRecipeIds }: MealPlanViewP
     )
   }
 
-  // Group recipes by day and meal type
-  const recipesByDay = mealPlan.meal_plan_recipes.reduce((acc, mpr) => {
-    const date = mpr.planned_for_date || 'unscheduled'
-    if (!acc[date]) acc[date] = { breakfast: null, lunch: null, dinner: null }
-    
-    // Get meal type from recipe or junction table
-    let mealTypeRaw = mpr.recipe?.meal_type || mpr.meal_type || 'other'
-    // Handle if it's an array, take first element
-    const mealType = (Array.isArray(mealTypeRaw) ? mealTypeRaw[0] : mealTypeRaw).toLowerCase()
-    
-    if (mealType === 'breakfast' || mealType === 'lunch' || mealType === 'dinner') {
-      acc[date][mealType as 'breakfast' | 'lunch' | 'dinner'] = mpr
+  const recipeGroups = mealPlan.meal_plan_recipes.reduce((acc, mpr) => {
+    if (!mpr.recipe) return acc
+    const key = mpr.recipe_id
+    if (!acc.has(key)) {
+      acc.set(key, { recipe: mpr.recipe, slots: [] as typeof mealPlan.meal_plan_recipes })
     }
-    
+    acc.get(key)!.slots.push(mpr)
     return acc
-  }, {} as Record<string, { breakfast: any, lunch: any, dinner: any }>)
+  }, new Map<string, { recipe: Recipe; slots: typeof mealPlan.meal_plan_recipes }>())
 
-  // Sort days chronologically
-  const sortedDays = Object.keys(recipesByDay).sort()
+  const getEarliestSlotDate = (slots: typeof mealPlan.meal_plan_recipes) => {
+    const dates = slots
+      .map(slot => slot.planned_for_date ? new Date(slot.planned_for_date) : null)
+      .filter((date): date is Date => !!date && !Number.isNaN(date.getTime()))
+    if (dates.length === 0) return null
+    return dates.sort((a, b) => a.getTime() - b.getTime())[0]
+  }
 
-  const formatDayLabel = (dateStr: string) => {
-    if (dateStr === 'unscheduled') return 'Unscheduled'
-    const date = new Date(dateStr + 'T00:00:00')
-    return date.toLocaleDateString('en-US', { 
-      weekday: 'long',
+  const groupedRecipes = Array.from(recipeGroups.values()).sort((a, b) => {
+    const aDate = getEarliestSlotDate(a.slots)
+    const bDate = getEarliestSlotDate(b.slots)
+    if (aDate && bDate) return aDate.getTime() - bDate.getTime()
+    if (aDate) return -1
+    if (bDate) return 1
+    return a.recipe.name.localeCompare(b.recipe.name)
+  })
+
+  const formatSlotLabel = (slot: MealPlanRecipe) => {
+    if (slot.slot_label) return slot.slot_label
+    const day = slot.planned_for_date
+      ? new Date(slot.planned_for_date + 'T00:00:00').toLocaleDateString('en-US', {
+          weekday: 'long'
+        })
+      : 'Unscheduled'
+    const meal = slot.meal_type ? slot.meal_type.charAt(0).toUpperCase() + slot.meal_type.slice(1) : 'Meal'
+    return `${day} ${meal}`
+  }
+
+  const formatSlotDate = (slot: MealPlanRecipe) => {
+    if (!slot.planned_for_date) return null
+    const date = new Date(slot.planned_for_date + 'T00:00:00')
+    if (Number.isNaN(date.getTime())) return null
+    return date.toLocaleDateString('en-US', {
       month: 'short',
       day: 'numeric'
     })
   }
 
-  const mealTypeEmojis = {
-    breakfast: '🍳',
-    lunch: '🥗',
-    dinner: '🍽️',
-    other: '🍴'
-  }
+  const plannedSlotSummaries = selectedRecipeSlots.map(slot => ({
+    label: formatSlotLabel(slot),
+    portionMultiplier: slot.portion_multiplier ?? 1,
+    plannedDate: slot.planned_for_date ?? null,
+    mealType: slot.meal_type ?? undefined
+  }))
 
   return (
     <div className="gg-bg-page min-h-screen">
@@ -386,7 +404,7 @@ export default function MealPlanView({ mealPlan, savedRecipeIds }: MealPlanViewP
                   Meal Plan for {formatDate(mealPlan.week_of)}
                 </h1>
                 <p className="gg-text-subtitle">
-                  {mealPlan.total_meals} meals • Created {new Date(mealPlan.created_at).toLocaleDateString()}
+                  {mealPlan.total_meals} meal slot{mealPlan.total_meals === 1 ? '' : 's'} • {groupedRecipes.length} unique recipe{groupedRecipes.length === 1 ? '' : 's'} • Created {new Date(mealPlan.created_at).toLocaleDateString()}
                 </p>
               </div>
               <div className="flex items-center gap-3">
@@ -421,7 +439,7 @@ export default function MealPlanView({ mealPlan, savedRecipeIds }: MealPlanViewP
                   <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
                   </svg>
-                  Recipes ({mealPlan.meal_plan_recipes.length})
+                  Recipes ({groupedRecipes.length})
                 </span>
               </button>
               <button
@@ -445,152 +463,128 @@ export default function MealPlanView({ mealPlan, savedRecipeIds }: MealPlanViewP
           {/* Content */}
           {activeTab === 'recipes' ? (
             <div className="space-y-8">
-              {sortedDays.map((day) => {
-                const meals = recipesByDay[day]
-                const mealTypes: Array<'breakfast' | 'lunch' | 'dinner'> = ['breakfast', 'lunch', 'dinner']
-                
-                return (
-                  <div key={day} className="gg-card">
-                    <h2 className="gg-heading-section mb-6 flex items-center gap-2">
-                      <svg className="h-6 w-6 text-[var(--gg-primary)]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                      </svg>
-                      <span>{formatDayLabel(day)}</span>
-                    </h2>
-                    
-                    <div className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
-                      {mealTypes.map((mealType) => {
-                        const mpr = meals[mealType]
-                        
-                        if (!mpr || !mpr.recipe) {
-                          return (
-                            <div
-                              key={mealType}
-                              className="rounded-xl border-2 border-dashed border-gray-300 bg-gray-50 p-6 flex flex-col items-center justify-center text-gray-400 min-h-[200px]"
-                            >
-                              <span className="text-4xl mb-2">{mealTypeEmojis[mealType]}</span>
-                              <span className="text-sm font-medium capitalize">{mealType}</span>
-                              <span className="text-xs mt-1">No recipe</span>
-                            </div>
-                          )
-                        }
-                        
-                        const recipe = mpr.recipe
-                        
-                        return (
-                          <div
-                            key={mpr.id}
-                            className="rounded-xl border-2 border-gray-200 bg-white p-6 transition-all hover:border-[var(--gg-primary)] hover:shadow-md"
-                          >
-                          <div className="flex items-start justify-between mb-4">
-                            <h3 className="gg-heading-card flex-1">{recipe.name}</h3>
-                            {recipe.meal_type && (
-                              <span className="inline-flex items-center justify-center gap-1 px-2 py-1 rounded-full bg-[var(--gg-primary)] text-xs font-semibold text-white capitalize ml-2 flex-shrink-0">
-                                {recipe.meal_type}
-                              </span>
-                            )}
-                          </div>
-                          
-                          {/* Meal Prep Batch Indicator */}
-                          {mpr.notes?.includes('Meal prep batch') && (
-                            <div className="mb-3">
-                              <span className="inline-flex items-center gap-1 px-3 py-1 bg-purple-100 text-purple-700 rounded-full text-xs font-semibold">
-                                🔄 {mpr.notes}
-                              </span>
-                            </div>
-                          )}
+              {groupedRecipes.length > 0 ? (
+                <div className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
+                  {groupedRecipes.map(({ recipe, slots }) => {
+                    const totalPortions = slots.reduce(
+                      (sum, slot) => sum + (slot.portion_multiplier ?? 1),
+                      0
+                    )
+                    const uniqueMealTypes = Array.from(
+                      new Set(
+                        slots
+                          .map(slot => slot.meal_type || recipe.meal_type)
+                          .flatMap(value => (Array.isArray(value) ? value : [value]))
+                          .filter(Boolean)
+                      )
+                    )
+                    const primaryMealType = uniqueMealTypes[0]
 
-                          {/* Show which other days use this recipe */}
-                          {(() => {
-                            const otherDays = mealPlan.meal_plan_recipes
-                              .filter(other => 
-                                other.recipe_id === recipe.id && 
-                                other.id !== mpr.id &&
-                                other.meal_type === mpr.meal_type
-                              )
-                              .map(other => {
-                                if (!other.planned_for_date) return null
-                                const date = new Date(other.planned_for_date + 'T00:00:00')
-                                return date.toLocaleDateString('en-US', { weekday: 'short' })
-                              })
-                              .filter(Boolean)
-                            
-                            if (otherDays.length > 0) {
+                    return (
+                      <div
+                        key={recipe.id}
+                        className="rounded-xl border-2 border-gray-200 bg-white p-6 transition-all hover:border-[var(--gg-primary)] hover:shadow-md flex flex-col"
+                      >
+                        <div className="flex items-start justify-between mb-4">
+                          <h3 className="gg-heading-card flex-1 pr-3">{recipe.name}</h3>
+                          {primaryMealType && (
+                            <span className="inline-flex items-center justify-center gap-1 px-2 py-1 rounded-full bg-[var(--gg-primary)] text-xs font-semibold text-white capitalize ml-2 flex-shrink-0">
+                              {primaryMealType}
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="mb-4 flex flex-wrap gap-3 text-sm text-gray-600">
+                          {recipe.prep_time_minutes && (
+                            <span className="flex items-center gap-1">
+                              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                              </svg>
+                              {recipe.prep_time_minutes}m
+                            </span>
+                          )}
+                          {recipe.servings && (
+                            <span className="flex items-center gap-1">
+                              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+                              </svg>
+                              {recipe.servings} servings cooked
+                            </span>
+                          )}
+                          <span className="flex items-center gap-1">
+                            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 8h14M5 12h14M5 16h14" />
+                            </svg>
+                            {slots.length} meal slot{slots.length === 1 ? '' : 's'} • {totalPortions} portion{totalPortions === 1 ? '' : 's'}
+                          </span>
+                        </div>
+
+                        <div className="mb-4">
+                          <p className="mb-2 text-sm font-semibold text-gray-700">Planned slots:</p>
+                          <div className="flex flex-wrap gap-2">
+                            {slots.map((slot) => {
+                              const slotDate = formatSlotDate(slot)
                               return (
-                                <div className="mb-3 p-2 bg-blue-50 border border-blue-200 rounded-lg">
-                                  <p className="text-xs text-blue-900">
-                                    <span className="font-semibold">Also served on:</span> {otherDays.join(', ')}
-                                  </p>
+                                <div
+                                  key={slot.id}
+                                  className="inline-flex items-center gap-2 rounded-full border border-gray-200 bg-gray-50 px-3 py-1 text-xs text-gray-700"
+                                >
+                                  <span className="font-medium">{formatSlotLabel(slot)}</span>
+                                  {slotDate && <span className="text-gray-400">({slotDate})</span>}
+                                  {(slot.portion_multiplier ?? 1) > 1 && (
+                                    <span className="inline-flex items-center gap-1 text-[var(--gg-primary)] font-semibold">
+                                      ×{slot.portion_multiplier}
+                                    </span>
+                                  )}
                                 </div>
                               )
-                            }
-                            return null
-                          })()}
-                          
-                          {/* Recipe Info */}
-                          <div className="mb-4 flex flex-wrap gap-3 text-sm text-gray-600">
-                            {recipe.prep_time_minutes && (
-                              <span className="flex items-center gap-1">
-                                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-                                </svg>
-                                {recipe.prep_time_minutes}m
-                              </span>
-                            )}
-                            {recipe.servings && (
-                              <span className="flex items-center gap-1">
-                                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
-                                </svg>
-                                {recipe.servings} servings
-                              </span>
-                            )}
+                            })}
                           </div>
+                        </div>
 
-                          {/* Ingredients */}
-                          <div className="mb-4">
-                            <p className="mb-2 text-sm font-semibold text-gray-700">Ingredients:</p>
-                            <ul className="space-y-1 text-sm text-gray-600">
-                              {recipe.ingredients.slice(0, 3).map((ing: { item: string; quantity: string }, idx: number) => (
-                                <li key={idx} className="flex items-start gap-2">
-                                  <span className="text-[var(--gg-primary)]">•</span>
-                                  <span>{ing.quantity} {ing.item}</span>
-                                </li>
-                              ))}
-                              {recipe.ingredients.length > 3 && (
-                                <li className="text-gray-400">
-                                  +{recipe.ingredients.length - 3} more...
-                                </li>
-                              )}
-                            </ul>
-                          </div>
+                        <div className="mb-4">
+                          <p className="mb-2 text-sm font-semibold text-gray-700">Ingredients:</p>
+                          <ul className="space-y-1 text-sm text-gray-600">
+                            {recipe.ingredients.slice(0, 3).map((ing: { item: string; quantity: string }, idx: number) => (
+                              <li key={idx} className="flex items-start gap-2">
+                                <span className="text-[var(--gg-primary)]">•</span>
+                                <span>{ing.quantity} {ing.item}</span>
+                              </li>
+                            ))}
+                            {recipe.ingredients.length > 3 && (
+                              <li className="text-gray-400 text-xs">
+                                +{recipe.ingredients.length - 3} more...
+                              </li>
+                            )}
+                          </ul>
+                        </div>
 
-                          {/* Recipe Actions */}
+                        <div className="mt-auto">
                           <div className="mb-3">
                             <RecipeCardActions
                               recipeId={recipe.id}
                               recipeName={recipe.name}
                               isFavorite={favoriteRecipes.has(recipe.id)}
-                              onReplace={handleReplaceRecipe}
+                              onReplace={(id) => handleReplaceRecipe(id, slots[0]?.meal_type || 'dinner')}
                               onToggleFavorite={handleToggleFavorite}
                             />
                           </div>
 
-                          <button 
-                            onClick={() => setSelectedRecipe(recipe)}
+                          <button
+                            onClick={() => {
+                              setSelectedRecipe(recipe)
+                              setSelectedRecipeSlots(slots)
+                            }}
                             className="gg-btn-outline w-full text-sm py-2"
                           >
                             View Full Recipe
                           </button>
                         </div>
-                        )
-                      })}
-                    </div>
-                  </div>
-                )
-              })}
-
-              {mealPlan.meal_plan_recipes.length === 0 && (
+                      </div>
+                    )
+                  })}
+                </div>
+              ) : (
                 <div className="gg-card text-center py-12">
                   <p className="gg-text-body text-gray-500">No recipes found for this meal plan.</p>
                 </div>
@@ -760,7 +754,11 @@ export default function MealPlanView({ mealPlan, savedRecipeIds }: MealPlanViewP
         <RecipeModal
           recipe={selectedRecipe}
           isOpen={!!selectedRecipe}
-          onClose={() => setSelectedRecipe(null)}
+          onClose={() => {
+            setSelectedRecipe(null)
+            setSelectedRecipeSlots([])
+          }}
+          plannedSlots={plannedSlotSummaries}
           onSaveCookingNote={handleSaveCookingNote}
           // onScaleServings={handleScaleServings} // COMMENTED OUT: Scale servings functionality
           // onSwapIngredient={handleSwapIngredient} // COMMENTED OUT: Swap ingredient functionality
@@ -773,7 +771,7 @@ export default function MealPlanView({ mealPlan, savedRecipeIds }: MealPlanViewP
         isOpen={isAdjustPanelOpen}
         onClose={() => setIsAdjustPanelOpen(false)}
         onApplyAdjustments={handleApplyAdjustments}
-        appliedAdjustments={mealPlan.survey_snapshot?.applied_adjustments || []}
+        appliedAdjustments={(mealPlan.survey_snapshot?.applied_adjustments as string[] | undefined) || []}
       />
 
       {/* Action Error Toast */}

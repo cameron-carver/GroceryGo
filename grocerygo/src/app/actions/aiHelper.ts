@@ -1,7 +1,7 @@
 'use server'
 
 import OpenAI from 'openai'
-import type { z } from 'zod'
+import { type z, toJSONSchema } from 'zod'
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -49,7 +49,7 @@ export async function callOpenAIStructured<T extends z.ZodType>(
         type: 'json_schema',
         json_schema: {
           name: schemaName,
-          schema: schema as any,
+          schema: toJSONSchema(schema),
           strict: true
         }
       },
@@ -65,8 +65,7 @@ export async function callOpenAIStructured<T extends z.ZodType>(
       }
     }
 
-    // Parse the JSON response
-    let parsedData: any
+    let parsedData: unknown
     try {
       parsedData = JSON.parse(response)
     } catch (parseError) {
@@ -77,7 +76,6 @@ export async function callOpenAIStructured<T extends z.ZodType>(
       }
     }
 
-    // Validate against schema
     const validationResult = schema.safeParse(parsedData)
     
     if (!validationResult.success) {
@@ -88,30 +86,37 @@ export async function callOpenAIStructured<T extends z.ZodType>(
       }
     }
 
-    // Response is guaranteed to match schema
     return {
       success: true,
       data: validationResult.data as z.infer<T>
     }
 
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error('OpenAI API error:', error)
 
-    if (error?.status === 401) {
+    const status = getErrorStatus(error)
+    if (status === 401) {
       return { success: false, error: 'Invalid OpenAI API key' }
     }
 
-    if (error?.status === 429) {
+    if (status === 429) {
       return { success: false, error: 'Rate limit exceeded. Please try again later.' }
     }
 
-    if (error?.status === 400 && error?.message?.includes('schema')) {
+    if (
+      typeof error === 'object' &&
+      error !== null &&
+      'message' in error &&
+      typeof (error as { message?: unknown }).message === 'string' &&
+      ((error as { status?: unknown }).status === 400) &&
+      ((error as { message: string }).message.includes('schema'))
+    ) {
       return { success: false, error: 'Invalid schema format. Please contact support.' }
     }
 
     return {
       success: false,
-      error: error?.message || 'Failed to call OpenAI API'
+      error: error instanceof Error ? error.message : 'Failed to call OpenAI API'
     }
   }
 }
@@ -188,22 +193,33 @@ export async function callOpenAI<T>(
       rawResponse: response
     }
 
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error('OpenAI API error:', error)
 
-    if (error?.status === 401) {
+    const status = getErrorStatus(error)
+    if (status === 401) {
       return { success: false, error: 'Invalid OpenAI API key' }
     }
 
-    if (error?.status === 429) {
+    if (status === 429) {
       return { success: false, error: 'Rate limit exceeded. Please try again later.' }
     }
 
     return {
       success: false,
-      error: error?.message || 'Failed to call OpenAI API'
+      error: error instanceof Error ? error.message : 'Failed to call OpenAI API'
     }
   }
+}
+
+function getErrorStatus(error: unknown): number | undefined {
+  if (typeof error === 'object' && error !== null && 'status' in error) {
+    const statusValue = (error as { status?: unknown }).status
+    if (typeof statusValue === 'number') {
+      return statusValue
+    }
+  }
+  return undefined
 }
 
 

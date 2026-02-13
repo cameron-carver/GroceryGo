@@ -46,8 +46,10 @@ Important Rules:
 6. Include both quantity and unit in the format: "quantity unit" (e.g., "2 cups", "1 lb", "3 each")
 `;
 
-const mealPlanFromSurveyPrompt = `You are an expert meal planner generating personalized meal plans based on user preferences.  
-Use the provided user input (below) to generate a detailed meal plan.
+import { GROCERY_CATEGORIES } from '@/data/ingredientShelfLife'
+
+const mealPlanFromSurveyPrompt = `You are an expert meal planner generating personalized meal plans based on user preferences.
+Use the provided user input (below) to generate a detailed meal plan that supports duplicating recipes across multiple meal slots.
 
 ### Input format example:
 {
@@ -108,8 +110,63 @@ Use the provided user input (below) to generate a detailed meal plan.
 11. **Measurement Units**:
 ${MEASUREMENT_UNITS_PROMPT}
 
+12. **Grocery Categories**: Each grocery item MUST include a "category" field from this list: ${GROCERY_CATEGORIES.join(', ')}. Choose the most appropriate category for each item. If unsure, use "Pantry".
+
 ---
 
-**Output Format**: The schema will define the exact structure required. Ensure each recipe includes the correct "mealType" field (Breakfast, Lunch, or Dinner).`;
+**Output Format**:
+JSON object with keys "recipes", "schedule", and "grocery_list", for example:
+{
+  "recipes": [
+    {
+      "id": "recipe-1",
+      "name": "Recipe Name",
+      "mealType": "Breakfast | Lunch | Dinner",
+      "servings": 4,
+      "ingredients": [
+        { "item": "Ingredient Name", "quantity": "Amount + Unit" }
+      ],
+      "steps": [
+        "Step 1",
+        "Step 2"
+      ]
+    }
+  ],
+  "schedule": [
+    {
+      "slotLabel": "Monday Lunch",
+      "day": "Monday",
+      "mealType": "Lunch",
+      "recipeId": "recipe-1",
+      "portionMultiplier": 1
+    }
+  ],
+  "grocery_list": [
+    { "item": "Ingredient Name", "quantity": "Total Amount + Unit", "category": "Produce" }
+  ]
+}
+
+**Important**:
+- Every recipe MUST include an "id" that will be referenced by the schedule array.
+- The "schedule" array MUST contain an entry for every selected meal slot (day + mealType) and reference an existing recipe id.
+- Every recipe MUST include a "mealType" field indicating the type of meal (Breakfast, Lunch, or Dinner).`;
+
+export function complexityTierPrompt(complexityMap: Record<string, string>): string {
+  const entries = Object.entries(complexityMap)
+  if (entries.length === 0) return ''
+
+  const dayLines = entries.map(([day, tier]) => {
+    switch (tier) {
+      case 'quick':
+        return `- ${day}: QUICK meal — under 20 minutes total, minimal ingredients, simple preparation`
+      case 'exploratory':
+        return `- ${day}: EXPLORATORY meal — 60+ minutes OK, try new cuisines or techniques, elaborate recipes encouraged`
+      default:
+        return `- ${day}: STANDARD meal — 30-45 minutes, normal home cooking`
+    }
+  }).join('\n')
+
+  return `\n\n### Day-Specific Meal Complexity (MANDATORY):\n${dayLines}\n\nRULES:\n- QUICK days: prep_time_minutes + cook_time_minutes MUST be under 20. Use 5 or fewer ingredients.\n- STANDARD days: prep_time_minutes + cook_time_minutes between 20-45.\n- EXPLORATORY days: prep_time_minutes + cook_time_minutes can be 45+. Use interesting ingredients, new cuisines, or advanced techniques.\n- This applies to ALL meals on that day.`
+}
 
 export { MEASUREMENT_UNITS_PROMPT, mealPlanFromSurveyPrompt };

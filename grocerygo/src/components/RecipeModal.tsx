@@ -15,6 +15,12 @@ interface RecipeModalProps {
   onSimplifySteps?: (recipeId: string) => void
   // Optional callback to save cooking notes
   onSaveCookingNote?: (recipeId: string, note: string) => void
+  plannedSlots?: Array<{
+    label: string
+    portionMultiplier: number
+    plannedDate?: string | null
+    mealType?: string
+  }>
 }
 
 interface ChatMessage {
@@ -30,8 +36,21 @@ export default function RecipeModal({
   onScaleServings,
   onSwapIngredient,
   onSimplifySteps,
-  onSaveCookingNote
+  onSaveCookingNote,
+  plannedSlots
 }: RecipeModalProps) {
+  const totalPlannedPortions = plannedSlots?.reduce((sum, slot) => sum + slot.portionMultiplier, 0)
+
+  const formatPlannedDate = (value?: string | null) => {
+    if (!value) return null
+    const date = new Date(value + 'T00:00:00')
+    if (Number.isNaN(date.getTime())) return null
+    return date.toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric'
+    })
+  }
+
   // State for cooking assistant
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [currentQuestion, setCurrentQuestion] = useState('')
@@ -164,6 +183,48 @@ export default function RecipeModal({
                 )}
               </div>
             </div>
+            
+            {plannedSlots && plannedSlots.length > 0 && (
+              <div className="mb-6 rounded-xl border border-green-100 bg-green-50 px-6 py-5">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div className="flex items-center gap-3">
+                    <svg className="h-5 w-5 text-green-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                    </svg>
+                    <div>
+                      <p className="font-semibold text-green-900 text-sm">
+                        Planned across {plannedSlots.length} meal slot{plannedSlots.length === 1 ? '' : 's'}
+                      </p>
+                      <p className="text-xs text-green-800">
+                        Cook once, enjoy {plannedSlots.length} times. Total portions planned: {totalPlannedPortions ?? recipe.servings ?? plannedSlots.length}.
+                      </p>
+                    </div>
+                  </div>
+                  {recipe.servings && (
+                    <span className="rounded-full bg-white px-3 py-1 text-xs font-semibold text-green-700 border border-green-200">
+                      Base recipe makes {recipe.servings} serving{recipe.servings === 1 ? '' : 's'}
+                    </span>
+                  )}
+                </div>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  {plannedSlots.map((slot, idx) => {
+                    const dateLabel = slot.plannedDate ? formatPlannedDate(slot.plannedDate) : null
+                    return (
+                      <span
+                        key={`${slot.label}-${idx}`}
+                        className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1 text-xs text-green-800 border border-green-200 shadow-sm"
+                      >
+                        <span className="font-semibold">{slot.label}</span>
+                        {dateLabel && <span className="text-gray-400">{dateLabel}</span>}
+                        <span className="inline-flex items-center gap-1 text-green-600 font-semibold">
+                          ×{slot.portionMultiplier}
+                        </span>
+                      </span>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
             
             {/* Close Button */}
             <button

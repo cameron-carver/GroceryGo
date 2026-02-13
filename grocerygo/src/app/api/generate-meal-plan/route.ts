@@ -1,9 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { createClient } from '@/utils/supabase/server'
-import { streamObject } from 'ai'
+import { streamText } from 'ai'
 import { openai } from '@ai-sdk/openai'
-import { mealPlanFromSurveyPrompt } from '@/app/meal-plan-generate/prompts'
-import { createMealPlanSchema } from '@/app/schemas/mealPlanSchemas'
+import { mealPlanFromSurveyPrompt, complexityTierPrompt } from '@/app/meal-plan-generate/prompts'
+import {
+  createMealPlanContext,
+  fetchUserSurveyResponse,
+  getMealPlanForUser
+} from '@/services/mealPlanService'
 
 interface MealSelection {
   breakfast: number
@@ -14,40 +17,25 @@ interface MealSelection {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { weekOf, mealSelection, mealPlanId } = body as {
-      weekOf: string
+    const { mealSelection, mealPlanId, distinctRecipeCounts, selectedSlots, complexityMap } = body as {
       mealSelection: MealSelection
       mealPlanId: string
+      distinctRecipeCounts?: MealSelection
+      selectedSlots?: Array<{ day: string; mealType: string }>
+      complexityMap?: Record<string, string>
     }
 
-    // Get authenticated user
-    const supabase = await createClient()
-    const { data: { user }, error: authError } = await supabase.auth.getUser()
+    const context = await createMealPlanContext()
+    const mealPlan = await getMealPlanForUser(context, mealPlanId)
 
-    if (authError || !user) {
-      return NextResponse.json({ error: 'User not authenticated' }, { status: 401 })
-    }
-
-    // Verify meal plan belongs to user
-    const { data: mealPlan, error: mealPlanError } = await supabase
-      .from('meal_plans')
-      .select('*')
-      .eq('id', mealPlanId)
-      .eq('user_id', user.id)
-      .single()
-
-    if (mealPlanError || !mealPlan) {
+    if (!mealPlan) {
       return NextResponse.json({ error: 'Meal plan not found' }, { status: 404 })
     }
 
-    // Get user's survey responses
-    const { data: userData } = await supabase
-      .from('users')
-      .select('survey_response')
-      .eq('user_id', user.id)
-      .single()
+    const surveyData =
+      mealPlan.survey_snapshot || (await fetchUserSurveyResponse(context))
 
-    if (!userData?.survey_response) {
+    if (!surveyData) {
       return NextResponse.json(
         { error: 'Please complete the onboarding survey first' },
         { status: 400 }
@@ -57,91 +45,132 @@ export async function POST(request: NextRequest) {
     // Calculate total meals
     const totalMeals = mealSelection.breakfast + mealSelection.lunch + mealSelection.dinner
 
-    // Build the prompt
-    const surveyData = userData.survey_response
-    
-    // Extract favored and excluded ingredients from survey response
-    const favoredIngredients = surveyData.favored_ingredients || []
-    const excludedIngredients = surveyData.excluded_ingredients || []
-    
-    // Build ingredient preferences section
+    // Determine distinct recipe counts (fallback to no-duplicate scenario)
+    const distinctCounts = distinctRecipeCounts
+      ?? (mealPlan.survey_snapshot?.distinct_recipe_counts as MealSelection | undefined)
+      ?? {
+        breakfast: mealSelection.breakfast,
+        lunch: mealSelection.lunch,
+        dinner: mealSelection.dinner
+      }
+
+    const slots = (selectedSlots?.length ? selectedSlots : mealPlan.survey_snapshot?.selected_slots) as Array<{
+      day: string
+      mealType: string
+    }> | undefined
+
+    const toTitleCase = (value: string) =>
+      value.charAt(0).toUpperCase() + value.slice(1).toLowerCase()
+
+    const resolvedSlots =
+      slots && slots.length > 0
+        ? slots.map((slot) => ({
+            day: slot.day,
+            mealType: toTitleCase(slot.mealType)
+          }))
+        : Array.from({ length: totalMeals }).map((_, index) => ({
+            day: 'Unscheduled',
+            mealType:
+              index < mealSelection.breakfast
+                ? 'Breakfast'
+                : index < mealSelection.breakfast + mealSelection.lunch
+                  ? 'Lunch'
+                  : 'Dinner'
+          }))
+
+    const slotListText = resolvedSlots
+      .map((slot, index) => {
+        const label = `${slot.day} ${slot.mealType}`
+        return `- Slot ${index + 1}: ${label}`
+      })
+      .join('\n')
+
+    const surveyJson = surveyData ?? {}
+    const favoredIngredients =
+      Array.isArray((surveyJson as Record<string, unknown>)?.favored_ingredients)
+        ? (surveyJson as Record<string, unknown>).favored_ingredients
+        : []
+    const excludedIngredients =
+      Array.isArray((surveyJson as Record<string, unknown>)?.excluded_ingredients)
+        ? (surveyJson as Record<string, unknown>).excluded_ingredients
+        : []
+
     let ingredientPreferencesSection = ''
-    if (favoredIngredients.length > 0 || excludedIngredients.length > 0) {
+    if (
+      Array.isArray(favoredIngredients) && favoredIngredients.length > 0 ||
+      Array.isArray(excludedIngredients) && excludedIngredients.length > 0
+    ) {
       ingredientPreferencesSection = '\n\n### Ingredient Preferences:\n'
-      
-      if (favoredIngredients.length > 0) {
+      if (Array.isArray(favoredIngredients) && favoredIngredients.length > 0) {
         ingredientPreferencesSection += `**Favored Ingredients (prioritize using these):** ${favoredIngredients.join(', ')}\n`
       }
-      
-      if (excludedIngredients.length > 0) {
+      if (Array.isArray(excludedIngredients) && excludedIngredients.length > 0) {
         ingredientPreferencesSection += `**Excluded Ingredients (NEVER use these):** ${excludedIngredients.join(', ')}\n`
       }
     }
 
-    // Get meal prep config from survey snapshot
-    const mealPrepConfig = mealPlan.survey_snapshot?.meal_prep_config
-    const uniqueRecipes = mealPlan.survey_snapshot?.unique_recipes || mealSelection
-
-    // Build meal prep instructions
-    let mealPrepInstructions = ''
-    if (mealPrepConfig) {
-      mealPrepInstructions = '\n\n### MEAL PREP MODE:\n'
-      mealPrepInstructions += 'The user wants to meal prep. Generate recipes with larger portion sizes:\n\n'
-      
-      Object.entries(mealPrepConfig).forEach(([mealType, batches]: [string, any]) => {
-        if (batches && batches.length > 0) {
-          mealPrepInstructions += `**${mealType.toUpperCase()}:**\n`
-          batches.forEach((batch: any, index: number) => {
-            const batchLetter = String.fromCharCode(65 + index)
-            mealPrepInstructions += `- Batch ${batchLetter}: 1 recipe for ${batch.days.length} days (${batch.days.join(', ')})\n`
-            mealPrepInstructions += `  Scale servings to: ${batch.days.length * 2} portions (or adjust based on typical serving size)\n`
-          })
-          mealPrepInstructions += '\n'
-        }
-      })
-    }
-    
     const enhancedPrompt = `${mealPlanFromSurveyPrompt}
 
 ### User Input:
 ${JSON.stringify(surveyData, null, 2)}
 ${ingredientPreferencesSection}
-${mealPrepInstructions}`
 
-    // Create dynamic schema with exact recipe count validation
-    // Use uniqueRecipes if in meal prep mode, otherwise use mealSelection
-    const mealPlanSchema = createMealPlanSchema(
-      uniqueRecipes.breakfast,
-      uniqueRecipes.lunch,
-      uniqueRecipes.dinner
-    )
+## 🎯 GENERATION REQUIREMENTS (MANDATORY)
 
-    // Use AI SDK's streamObject with schema enforcement
-    const result = streamObject({
+**Recipe Count:** You MUST generate exactly ${totalMeals} recipes total.
+
+**Breakdown (total meal slots):**
+- ${mealSelection.breakfast} slots for "Breakfast"
+- ${mealSelection.lunch} slots for "Lunch"
+- ${mealSelection.dinner} slots for "Dinner"
+
+**Unique recipe targets (per mealType):**
+- Create exactly ${distinctCounts.breakfast} unique breakfast recipe(s)
+- Create exactly ${distinctCounts.lunch} unique lunch recipe(s)
+- Create exactly ${distinctCounts.dinner} unique dinner recipe(s)
+
+**Process:**
+1. Generate the unique recipes (IDs) per meal type.
+2. Each recipe\'s "servings" must equal the total number of schedule portions assigned to that recipe.
+3. Build the schedule array so that EVERY slot listed below is mapped to one of the recipe IDs:
+
+${slotListText}
+
+4. For duplicated recipes, reuse the same recipe ID and set \`portionMultiplier\` (integer >= 1) for each slot, typically 1 per person.
+5. VALIDATE before returning:
+   - Unique recipe counts per meal type match the targets above.
+   - Schedule length equals ${resolvedSlots.length} and covers every slot exactly once.
+   - Every schedule entry references a valid recipe ID.
+
+**Critical:** The "recipes" array must contain exactly ${
+      distinctCounts.breakfast + distinctCounts.lunch + distinctCounts.dinner
+    } unique recipe objects.${complexityMap ? complexityTierPrompt(complexityMap) : ''}`
+
+    const result = streamText({
       model: openai('gpt-4o'),
-      schema: mealPlanSchema,
-      schemaName: 'MealPlanResponse',
-      schemaDescription: 'A complete meal plan with recipes and grocery list',
-      mode: 'json',
-      providerOptions: {
-        openai: {
-          structuredOutputs: true,
-          strictJsonSchema: true,
-        },
-      },
-      system: `You are an expert meal planning assistant for GroceryGo. Generate detailed and personalized meal plans with recipes and a corresponding grocery list.
+      system: `You are an expert meal planning assistant for GroceryGo. Generate detailed and personalized meal plans with recipes and a corresponding grocery list in JSON format.
 
-Follow the provided schema structure exactly and adhere to all measurement unit guidelines in the prompt.`,
+CRITICAL RULES:
+- Generate the EXACT number of recipes requested—no more, no less
+- After generating all recipes, COUNT them and verify the total matches exactly
+- If the count is wrong, you MUST regenerate until it matches
+- Follow measurement units and formatting guidelines strictly
+
+PROCESS:
+1. Plan: Determine recipe distribution (X breakfasts, Y lunches, Z dinners)
+2. Generate: Create each recipe group-by-group (all breakfasts, then all lunches, then all dinners)
+3. Validate: Count recipes per meal type and total before outputting
+4. Output: Return only if validation passes`,
       prompt: enhancedPrompt,
     })
 
     // Return the stream as a response
     return result.toTextStreamResponse()
 
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error('API error:', error)
     return NextResponse.json(
-      { error: error?.message || 'Failed to generate meal plan' },
+      { error: error instanceof Error ? error.message : 'Failed to generate meal plan' },
       { status: 500 }
     )
   }

@@ -1,15 +1,15 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import Link from 'next/link'
-import type { MealPlanWithRecipes, Recipe } from '@/types/database'
+import type { MealPlanWithRecipes, Recipe, SurveyResponse } from '@/types/database'
 import RecipeModal from '@/components/RecipeModal'
 import Pagination from '@/components/Pagination'
 import { updateSurveyResponse, getPaginatedMealPlans } from './actions'
-import { questions, questionLabels } from '@/app/schemas/userPreferenceQuestions'
+import { questions } from '@/app/schemas/userPreferenceQuestions'
 
 interface DashboardClientProps {
-  surveyResponse: Record<string, any> | null
+  surveyResponse: SurveyResponse | null
   mealPlans: MealPlanWithRecipes[]
   savedRecipes: Array<{
     id: string
@@ -173,14 +173,25 @@ export default function DashboardClient({
               <h1 className="gg-heading-page mb-2">My Dashboard</h1>
               <p className="gg-text-subtitle">Manage your meal plans and preferences</p>
             </div>
-            <Link href="/meal-plan-generate">
-              <button className="gg-btn-primary gap-2">
+            <div className="flex items-center gap-3">
+              <Link href="/meal-plan-generate">
+                <button className="gg-btn-primary gap-2">
+                  <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                  </svg>
+                  Generate New Meal Plan
+                </button>
+              </Link>
+              <Link
+                href="/week-preview"
+                className="gg-btn-outline flex items-center gap-2"
+              >
                 <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
                 </svg>
-                Generate New Meal Plan
-              </button>
-            </Link>
+                Plan with Calendar
+              </Link>
+            </div>
           </div>
 
           <div className="grid grid-cols-1 gap-8 lg:grid-cols-3">
@@ -414,7 +425,8 @@ export default function DashboardClient({
                       // Ensure ingredient lists are always included
                       favored_ingredients: surveyResponse.favored_ingredients || [],
                       excluded_ingredients: surveyResponse.excluded_ingredients || [],
-                    }).map(([questionId, answer]) => {
+                    }).map(([questionId, rawAnswer]) => {
+                      const answer = rawAnswer as string | string[]
                       const config = questionConfigs[questionId]
                       const isEditing = editingQuestion === questionId
                       

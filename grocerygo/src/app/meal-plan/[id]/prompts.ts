@@ -1,3 +1,5 @@
+import type { SurveyResponse } from '@/types/database'
+
 const MEASUREMENT_UNITS_PROMPT = `
 When specifying ingredient quantities, use these standardized measurement units based on Instacart's API requirements:
 
@@ -47,14 +49,14 @@ Important Rules:
 `;
 
 export const replaceRecipePrompt = (
-  surveyData: Record<string, any>,
+  surveyData: SurveyResponse,
   mealType: string,
   existingIngredients: string[],
   recipeToReplace: string
 ) => {
   // Extract favored and excluded ingredients
-  const favoredIngredients = surveyData.favored_ingredients || []
-  const excludedIngredients = surveyData.excluded_ingredients || []
+  const favoredIngredients = (surveyData.favored_ingredients || []) as string[]
+  const excludedIngredients = (surveyData.excluded_ingredients || []) as string[]
   
   let ingredientPreferencesSection = ''
   if (favoredIngredients.length > 0 || excludedIngredients.length > 0) {
@@ -70,8 +72,8 @@ export const replaceRecipePrompt = (
   }
   
   // Check if protein requirement applies
-  const goals = surveyData['9'] || []
-  const priorities = surveyData['11'] || []
+  const goals = (surveyData['9'] || []) as string[]
+  const priorities = (surveyData['11'] || []) as string[]
   const requiresProtein = goals.includes('Eat healthier') || priorities[0] === 'Nutrition'
   
   let proteinRequirement = ''
@@ -130,7 +132,7 @@ Note: additional_grocery_items should only include NEW ingredients not in the ex
 };
 
 export const bulkAdjustmentPrompt = (
-  surveyData: Record<string, any>,
+  surveyData: SurveyResponse,
   adjustments: {
     reduceTime?: boolean
     lowerBudget?: boolean
@@ -159,8 +161,8 @@ export const bulkAdjustmentPrompt = (
   }
 
   // Extract favored and excluded ingredients
-  const favoredIngredients = surveyData.favored_ingredients || []
-  const excludedIngredients = surveyData.excluded_ingredients || []
+  const favoredIngredients = (surveyData.favored_ingredients || []) as string[]
+  const excludedIngredients = (surveyData.excluded_ingredients || []) as string[]
   
   let ingredientPreferencesSection = ''
   if (favoredIngredients.length > 0 || excludedIngredients.length > 0) {
@@ -176,8 +178,8 @@ export const bulkAdjustmentPrompt = (
   }
 
   // Check if protein requirement applies
-  const goals = surveyData['9'] || []
-  const priorities = surveyData['11'] || []
+  const goals = (surveyData['9'] || []) as string[]
+  const priorities = (surveyData['11'] || []) as string[]
   const requiresProtein = goals.includes('Eat healthier') || priorities[0] === 'Nutrition'
   
   let proteinRequirement = ''
@@ -191,6 +193,12 @@ Since the user has "Eat healthier" as a goal or "Nutrition" as their #1 priority
 - Minimum 15-20g protein per serving\n`
   }
 
+  /**
+   * NOTE FOR FUTURE IMPROVEMENTS:
+   *   1. Add a validation checklist in the prompt so GPT confirms both recipes & schedule sections were produced.
+   *   2. Consider switching regenerateWithAdjustments to callOpenAIStructured with a schema that requires schedule entries.
+   *   3. Extend server-side fallback/repair logic so downstream inserts always receive a complete schedule even if GPT skips it.
+   */
   return `You are an expert meal planner regenerating a complete meal plan with specific optimizations.
 
 ### User Preferences:

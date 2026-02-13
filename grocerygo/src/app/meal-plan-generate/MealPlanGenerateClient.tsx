@@ -1,16 +1,17 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
-import { generateMealPlanFromPreferences, replaceExistingMealPlan } from '@/app/meal-plan-generate/actions'
+import {
+  generateMealPlanFromPreferences,
+  replaceExistingMealPlan,
+  type GenerateMealPlanResponse,
+  type GenerateMealPlanConflict,
+  type GenerateMealPlanError
+} from '@/app/meal-plan-generate/actions'
 import { getNextWeekStart } from '@/utils/mealPlanDates'
-import { 
-  MealPrepInterface, 
-  MealPrepSummary,
-  type MealSelections,
-  type MealPrepConfig
-} from './MealPrepComponents'
+import type { SurveyResponse } from '@/types/database'
 
 const daysOfWeek = [
   { short: 'Mon', full: 'Monday' },
@@ -24,16 +25,75 @@ const daysOfWeek = [
 
 type MealType = 'breakfast' | 'lunch' | 'dinner'
 
-export default function MealPlanGenerateClient() {
+interface MealSelections {
+  [key: string]: {
+    breakfast: boolean
+    lunch: boolean
+    dinner: boolean
+  }
+}
+
+interface DistinctCounts {
+  breakfast: number
+  lunch: number
+  dinner: number
+}
+
+interface MealPlanGenerateClientProps {
+  surveyResponse: SurveyResponse
+  complexityMap?: Record<string, string>
+  weekScoreId?: string
+}
+
+function isErrorResponse(response: GenerateMealPlanResponse): response is GenerateMealPlanError {
+  return 'error' in response && !('conflict' in response) && !('success' in response && response.success)
+}
+
+function parseLunchPreference(preference?: string, totalSlots?: number) {
+  if (!preference || !totalSlots || totalSlots === 0) return undefined
+
+  const numberMatch = preference.match(/\d+/)
+  if (!numberMatch) return undefined
+
+  const parsed = parseInt(numberMatch[0], 10)
+  if (Number.isNaN(parsed) || parsed <= 0) return undefined
+
+  return Math.min(parsed, totalSlots)
+}
+
+function deriveBaseDistinct(totalSlots: number, leftoverPreference?: string) {
+  if (totalSlots === 0) return 0
+
+  switch (leftoverPreference) {
+    case 'Prefer unique meals every time':
+      return totalSlots
+    case 'Happy to eat leftovers once more':
+      return Math.max(1, Math.ceil(totalSlots / 2))
+    case 'Comfortable repeating meals multiple times':
+      return Math.max(1, Math.ceil(totalSlots / 3))
+    default:
+      return Math.max(1, Math.ceil(totalSlots / 2))
+  }
+}
+
+function clampDistinctCounts(
+  counts: DistinctCounts,
+  totals: { breakfast: number; lunch: number; dinner: number }
+): DistinctCounts {
+  return {
+    breakfast: Math.min(Math.max(counts.breakfast, totals.breakfast === 0 ? 0 : 1), Math.max(totals.breakfast, 0)),
+    lunch: Math.min(Math.max(counts.lunch, totals.lunch === 0 ? 0 : 1), Math.max(totals.lunch, 0)),
+    dinner: Math.min(Math.max(counts.dinner, totals.dinner === 0 ? 0 : 1), Math.max(totals.dinner, 0))
+  }
+}
+
+export default function MealPlanGenerateClient({ surveyResponse, complexityMap, weekScoreId }: MealPlanGenerateClientProps) {
   const router = useRouter()
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [success, setSuccess] = useState(false)
   const [showReplaceDialog, setShowReplaceDialog] = useState(false)
-  const [conflictData, setConflictData] = useState<{
-    existingPlanId: string
-    weekOf: string
-  } | null>(null)
+  const [conflictData, setConflictData] = useState<Pick<GenerateMealPlanConflict, 'existingPlanId' | 'weekOf'> | null>(null)
 
   // Initialize with all meals selected
   const [selections, setSelections] = useState<MealSelections>(
@@ -43,12 +103,31 @@ export default function MealPlanGenerateClient() {
     }), {})
   )
 
-  // Meal prep mode state
-  const [mealPrepMode, setMealPrepMode] = useState(true)
-  const [mealPrepConfig, setMealPrepConfig] = useState<MealPrepConfig>({
-    breakfast: [],
-    lunch: [],
-    dinner: []
+  const leftoverPreference = (surveyResponse?.['12'] ?? surveyResponse?.[12]) as string | undefined
+  const lunchPreference = (surveyResponse?.['13'] ?? surveyResponse?.[13]) as string | undefined
+
+  const initialTotals = useMemo(
+    () => ({
+      breakfast: daysOfWeek.length,
+      lunch: daysOfWeek.length,
+      dinner: daysOfWeek.length
+    }),
+    []
+  )
+
+  const [distinctCounts, setDistinctCounts] = useState<DistinctCounts>(() => {
+    const baseCounts: DistinctCounts = {
+      breakfast: deriveBaseDistinct(initialTotals.breakfast, leftoverPreference),
+      lunch: deriveBaseDistinct(initialTotals.lunch, leftoverPreference),
+      dinner: deriveBaseDistinct(initialTotals.dinner, leftoverPreference)
+    }
+
+    const parsedLunch = parseLunchPreference(lunchPreference, initialTotals.lunch)
+    if (parsedLunch !== undefined) {
+      baseCounts.lunch = Math.max(1, parsedLunch)
+    }
+
+    return clampDistinctCounts(baseCounts, initialTotals)
   })
 
   const toggleMeal = (day: string, mealType: MealType) => {
@@ -87,62 +166,64 @@ export default function MealPlanGenerateClient() {
     })
   }
 
-  const getTotalMeals = () => {
-    let breakfast = 0, lunch = 0, dinner = 0
+  const totals = useMemo(() => {
+    let breakfast = 0
+    let lunch = 0
+    let dinner = 0
+
     Object.values(selections).forEach(day => {
-      if (day.breakfast) breakfast++
-      if (day.lunch) lunch++
-      if (day.dinner) dinner++
+      if (day.breakfast) breakfast += 1
+      if (day.lunch) lunch += 1
+      if (day.dinner) dinner += 1
     })
-    return { breakfast, lunch, dinner, total: breakfast + lunch + dinner }
-  }
 
-  const getMealSchedule = () => {
-    const schedule: Array<{
-      day: string
-      mealType: 'breakfast' | 'lunch' | 'dinner'
-    }> = []
-    
-    // Iterate through days in order to preserve the sequence
-    daysOfWeek.forEach((day) => {
-      const daySelections = selections[day.full]
-      
-      if (daySelections.breakfast) {
-        schedule.push({ day: day.full, mealType: 'breakfast' })
-      }
-      if (daySelections.lunch) {
-        schedule.push({ day: day.full, mealType: 'lunch' })
-      }
-      if (daySelections.dinner) {
-        schedule.push({ day: day.full, mealType: 'dinner' })
-      }
-    })
-    
-    return schedule
-  }
-
-  const getUniqueRecipesNeeded = () => {
-    if (!mealPrepMode) {
-      return getTotalMeals()
+    return {
+      breakfast,
+      lunch,
+      dinner,
+      total: breakfast + lunch + dinner
     }
-    
-    const breakfast = mealPrepConfig.breakfast.length
-    const lunch = mealPrepConfig.lunch.length
-    const dinner = mealPrepConfig.dinner.length
-    
-    return { breakfast, lunch, dinner, total: breakfast + lunch + dinner }
+  }, [selections])
+
+  const selectedSlots = useMemo(
+    () =>
+      daysOfWeek.flatMap((day) =>
+        (['breakfast', 'lunch', 'dinner'] as MealType[]).reduce<Array<{ day: string; mealType: MealType }>>(
+          (acc, mealType) => {
+            if (selections[day.full][mealType]) {
+              acc.push({ day: day.full, mealType })
+            }
+            return acc
+          },
+          []
+        )
+      ),
+    [selections]
+  )
+
+  useEffect(() => {
+    setDistinctCounts(prev =>
+      clampDistinctCounts(prev, {
+        breakfast: totals.breakfast,
+        lunch: totals.lunch,
+        dinner: totals.dinner
+      })
+    )
+  }, [totals.breakfast, totals.lunch, totals.dinner])
+
+  const updateDistinctCount = (mealType: MealType, value: number) => {
+    setDistinctCounts(prev => {
+      const updated = { ...prev, [mealType]: value }
+      return clampDistinctCounts(updated, {
+        breakfast: totals.breakfast,
+        lunch: totals.lunch,
+        dinner: totals.dinner
+      })
+    })
   }
 
   const handleGenerate = async () => {
-    const totals = getTotalMeals()
-    const uniqueRecipes = getUniqueRecipesNeeded()
-    
-    if (mealPrepMode && uniqueRecipes.total === 0) {
-      setError('Please create at least one meal prep batch to generate')
-      return
-    }
-    
-    if (!mealPrepMode && totals.total === 0) {
+    if (totals.total === 0) {
       setError('Please select at least one meal to generate')
       return
     }
@@ -156,8 +237,6 @@ export default function MealPlanGenerateClient() {
       // TODO: Make this configurable via user settings in the future
       const weekOf = getNextWeekStart('Monday')
 
-      const mealSchedule = getMealSchedule()
-
       const result = await generateMealPlanFromPreferences(
         weekOf,
         {
@@ -165,30 +244,30 @@ export default function MealPlanGenerateClient() {
           lunch: totals.lunch,
           dinner: totals.dinner
         },
-        mealSchedule,
-        mealPrepMode ? mealPrepConfig : undefined
+        distinctCounts,
+        selectedSlots,
+        complexityMap
       )
 
       // Check if there's a conflict (existing meal plan)
-      if ((result as any).conflict) {
+      if ('conflict' in result && result.conflict) {
         setConflictData({
-          existingPlanId: (result as any).existingPlanId,
-          weekOf: (result as any).weekOf
+          existingPlanId: result.existingPlanId,
+          weekOf: result.weekOf
         })
         setShowReplaceDialog(true)
         setLoading(false)
         return
       }
 
-      if (result.error) {
-        if (result.needsSurvey) {
-          setError(result.error)
+      if (isErrorResponse(result)) {
+        const { error: message, needsSurvey } = result
+        setError(message)
+        if (needsSurvey) {
           setTimeout(() => router.push('/onboarding'), 2000)
-        } else {
-          setError(result.error)
         }
         setLoading(false)
-      } else if (result.success && result.mealPlanId) {
+      } else if ('success' in result && result.success) {
         // Redirect to streaming generation page
         router.push(`/meal-plan/generating/${result.mealPlanId}`)
       } else {
@@ -205,16 +284,12 @@ export default function MealPlanGenerateClient() {
   const handleReplace = async () => {
     if (!conflictData) return
 
-    const totals = getTotalMeals()
-    
     setLoading(true)
     setError('')
     setSuccess(false)
     setShowReplaceDialog(false)
 
     try {
-      const mealSchedule = getMealSchedule()
-
       const result = await replaceExistingMealPlan(
         conflictData.existingPlanId,
         conflictData.weekOf,
@@ -223,19 +298,19 @@ export default function MealPlanGenerateClient() {
           lunch: totals.lunch,
           dinner: totals.dinner
         },
-        mealSchedule,
-        mealPrepMode ? mealPrepConfig : undefined
+        distinctCounts,
+        selectedSlots,
+        complexityMap
       )
 
-      if (result.error) {
-        if (result.needsSurvey) {
-          setError(result.error)
+      if (isErrorResponse(result)) {
+        const { error: message, needsSurvey } = result
+        setError(message)
+        if (needsSurvey) {
           setTimeout(() => router.push('/onboarding'), 2000)
-        } else {
-          setError(result.error)
         }
         setLoading(false)
-      } else if (result.success && result.mealPlanId) {
+      } else if ('success' in result && result.success) {
         // Redirect to streaming generation page
         router.push(`/meal-plan/generating/${result.mealPlanId}`)
       } else {
@@ -253,9 +328,6 @@ export default function MealPlanGenerateClient() {
     setShowReplaceDialog(false)
     setConflictData(null)
   }
-
-  const totals = getTotalMeals()
-  const uniqueRecipes = getUniqueRecipesNeeded()
 
   return (
     <div className="gg-bg-page min-h-screen">
@@ -279,40 +351,12 @@ export default function MealPlanGenerateClient() {
             </p>
           </div>
 
-          {/* Meal Prep Mode Toggle */}
-          <div className="mb-6 p-4 bg-gradient-to-r from-purple-50 to-blue-50 rounded-xl border-2 border-purple-200">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <span className="text-3xl">🔄</span>
-                <div>
-                  <h3 className="font-bold text-gray-900">Meal Prep Mode</h3>
-                  <p className="text-sm text-gray-600">
-                    Use the same recipe across multiple days to save time
-                  </p>
-                </div>
-              </div>
-              <button
-                onClick={() => setMealPrepMode(!mealPrepMode)}
-                className={`relative inline-flex h-8 w-14 items-center rounded-full transition-colors ${
-                  mealPrepMode ? 'bg-[var(--gg-primary)]' : 'bg-gray-300'
-                }`}
-              >
-                <span
-                  className={`inline-block h-6 w-6 transform rounded-full bg-white transition-transform ${
-                    mealPrepMode ? 'translate-x-7' : 'translate-x-1'
-                  }`}
-                />
-              </button>
-            </div>
-          </div>
-
           <div className="grid grid-cols-1 gap-8 lg:grid-cols-3">
             
             {/* Main Content - Meal Selector */}
             <div className="lg:col-span-2">
-              {!mealPrepMode ? (
-                <div className="gg-card">
-                  <h2 className="gg-heading-section mb-6">Select Your Meals</h2>
+              <div className="gg-card">
+                <h2 className="gg-heading-section mb-6">Select Your Meals</h2>
 
                 {/* Meal Type Headers */}
                 <div className="flex items-center gap-4 mb-3 px-3">
@@ -424,14 +468,7 @@ export default function MealPlanGenerateClient() {
                     </button>
                   </div>
                 </div>
-                </div>
-              ) : (
-                <MealPrepInterface
-                  selections={selections}
-                  mealPrepConfig={mealPrepConfig}
-                  setMealPrepConfig={setMealPrepConfig}
-                />
-              )}
+              </div>
             </div>
 
             {/* Sidebar - Summary & Generate */}
@@ -439,57 +476,110 @@ export default function MealPlanGenerateClient() {
               
               {/* Summary Card */}
               <div className="gg-card">
-                <h2 className="gg-heading-section mb-6">
-                  {mealPrepMode ? 'Meal Prep Summary' : 'Meal Summary'}
-                </h2>
-                
-                {mealPrepMode ? (
-                  <MealPrepSummary mealPrepConfig={mealPrepConfig} />
-                ) : (
-                  <div className="space-y-4">
-                    <div className="flex items-center justify-between py-3 border-b border-gray-100">
-                      <div className="flex items-center gap-2">
-                        <span className="text-2xl">🍳</span>
-                        <span className="gg-text-body">Breakfasts</span>
-                      </div>
-                      <span className="text-2xl font-bold text-[var(--gg-primary)]">
-                        {totals.breakfast}
-                      </span>
+                <h2 className="gg-heading-section mb-6">Meal Summary</h2>
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between py-3 border-b border-gray-100">
+                    <div className="flex items-center gap-2">
+                      <span className="text-2xl">🍳</span>
+                      <span className="gg-text-body">Breakfasts</span>
                     </div>
-                    <div className="flex items-center justify-between py-3 border-b border-gray-100">
-                      <div className="flex items-center gap-2">
-                        <span className="text-2xl">🥗</span>
-                        <span className="gg-text-body">Lunches</span>
-                      </div>
-                      <span className="text-2xl font-bold text-[var(--gg-primary)]">
-                        {totals.lunch}
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between py-3 border-b border-gray-100">
-                      <div className="flex items-center gap-2">
-                        <span className="text-2xl">🍽️</span>
-                        <span className="gg-text-body">Dinners</span>
-                      </div>
-                      <span className="text-2xl font-bold text-[var(--gg-primary)]">
-                        {totals.dinner}
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between py-3 bg-opacity-10 rounded-lg px-4">
-                      <span className="font-semibold text-gray-900 text-2xl">Total Meals</span>
-                      <span className="text-3xl font-bold text-[var(--gg-primary)]">
-                        {totals.total}
-                      </span>
-                    </div>
+                    <span className="text-2xl font-bold text-[var(--gg-primary)]">
+                      {totals.breakfast}
+                    </span>
                   </div>
-                )}
+                  <div className="flex items-center justify-between py-3 border-b border-gray-100">
+                    <div className="flex items-center gap-2">
+                      <span className="text-2xl">🥗</span>
+                      <span className="gg-text-body">Lunches</span>
+                    </div>
+                    <span className="text-2xl font-bold text-[var(--gg-primary)]">
+                      {totals.lunch}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between py-3 border-b border-gray-100">
+                    <div className="flex items-center gap-2">
+                      <span className="text-2xl">🍽️</span>
+                      <span className="gg-text-body">Dinners</span>
+                    </div>
+                    <span className="text-2xl font-bold text-[var(--gg-primary)]">
+                      {totals.dinner}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between py-3 bg-opacity-10 rounded-lg px-4">
+                    <span className="font-semibold text-gray-900 text-2xl">Total Meals</span>
+                    <span className="text-3xl font-bold text-[var(--gg-primary)]">
+                      {totals.total}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Distinct Recipe Controls */}
+              <div className="gg-card">
+                <h2 className="gg-heading-section mb-4">Unique Recipe Targets</h2>
+                <p className="text-sm text-gray-600 mb-4">
+                  Prefer to cook once and eat twice? Set the number of different recipes you want to cook for each meal type. We&apos;ll duplicate recipes across the selected slots when this number is lower.
+                </p>
+                <div className="space-y-4">
+                  {(['breakfast', 'lunch', 'dinner'] as MealType[]).map((mealType) => (
+                    <div key={mealType} className="flex flex-col gap-2 border border-gray-100 rounded-lg p-4">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <span className="text-lg">
+                            {mealType === 'breakfast' ? '🍳' : mealType === 'lunch' ? '🥗' : '🍽️'}
+                          </span>
+                          <span className="gg-text-body capitalize">{mealType}</span>
+                        </div>
+                        <span className="text-sm text-gray-500">
+                          {totals[mealType]} selected slot{totals[mealType] === 1 ? '' : 's'}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="text-sm text-gray-600 flex-1">
+                          Unique recipes
+                        </p>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => updateDistinctCount(mealType, distinctCounts[mealType] - 1)}
+                            disabled={distinctCounts[mealType] <= (totals[mealType] === 0 ? 0 : 1)}
+                            className="h-9 w-9 flex items-center justify-center rounded-full border border-gray-200 text-gray-600 hover:bg-gray-100 disabled:opacity-40 disabled:cursor-not-allowed"
+                          >
+                            −
+                          </button>
+                          <input
+                            type="number"
+                            min={totals[mealType] === 0 ? 0 : 1}
+                            max={Math.max(totals[mealType], totals[mealType] === 0 ? 0 : 1)}
+                            value={distinctCounts[mealType]}
+                            onChange={(event) => {
+                              const nextValue = parseInt(event.target.value, 10)
+                              if (Number.isNaN(nextValue)) return
+                              updateDistinctCount(mealType, nextValue)
+                            }}
+                            className="w-16 rounded-lg border border-gray-200 px-2 py-2 text-center text-sm focus:border-[var(--gg-primary)] focus:outline-none"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => updateDistinctCount(mealType, distinctCounts[mealType] + 1)}
+                            disabled={distinctCounts[mealType] >= totals[mealType]}
+                            className="h-9 w-9 flex items-center justify-center rounded-full border border-gray-200 text-gray-600 hover:bg-gray-100 disabled:opacity-40 disabled:cursor-not-allowed"
+                          >
+                            +
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </div>
 
               {/* Generate Button */}
               <button
                 onClick={handleGenerate}
-                disabled={loading || uniqueRecipes.total === 0}
+                disabled={loading || totals.total === 0}
                 className={`gg-btn-primary w-full flex items-center justify-center gap-2 ${
-                  (loading || uniqueRecipes.total === 0) ? 'opacity-50 cursor-not-allowed' : ''
+                  (loading || totals.total === 0) ? 'opacity-50 cursor-not-allowed' : ''
                 }`}
               >
                 {loading ? (

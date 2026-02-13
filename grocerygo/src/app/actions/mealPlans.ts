@@ -8,7 +8,8 @@ import type {
   MealPlanRecipeInsert,
   GroceryItemInsert,
   AIGeneratedMealPlan,
-  MealPlanWithRecipes
+  MealPlanWithRecipes,
+  SurveyResponse
 } from '@/types/database'
 
 /**
@@ -23,15 +24,28 @@ export async function createMealPlanFromAI(
   userId: string,
   weekOf: string,
   aiResponse: AIGeneratedMealPlan,
-  surveySnapshot?: Record<string, any>
+  surveySnapshot?: SurveyResponse
 ) {
   const supabase = await createClient()
+  type GroupedResponse = AIGeneratedMealPlan & {
+    breakfast?: AIGeneratedMealPlan['recipes']
+    lunch?: AIGeneratedMealPlan['recipes']
+    dinner?: AIGeneratedMealPlan['recipes']
+  }
+
+  const groupedResponse = aiResponse as GroupedResponse
+  const allRecipes =
+    Array.isArray(aiResponse.recipes) && aiResponse.recipes.length > 0
+      ? aiResponse.recipes
+      : [
+          ...(groupedResponse.breakfast ?? []),
+          ...(groupedResponse.lunch ?? []),
+          ...(groupedResponse.dinner ?? [])
+        ]
+
+  const totalMeals = aiResponse.schedule?.length ?? allRecipes.length
 
   try {
-    // Calculate total meals from all arrays
-    const totalMeals = (aiResponse.breakfast?.length || 0) + 
-                      (aiResponse.lunch?.length || 0) + 
-                      (aiResponse.dinner?.length || 0)
 
     // 1. Create the meal plan record
     const { data: mealPlan, error: mealPlanError } = await supabase
@@ -55,16 +69,15 @@ export async function createMealPlanFromAI(
 
     // 2. Create recipes (vector-based deduplication to be added later)
     const recipeIds: string[] = []
+    const recipeIdMap: Record<string, string> = {}
     const recipeErrors: string[] = []
     
-    // Merge breakfast, lunch, and dinner arrays into single recipes array
-    const allRecipes = [
-      ...(aiResponse.breakfast || []),
-      ...(aiResponse.lunch || []),
-      ...(aiResponse.dinner || [])
-    ]
-    
     for (const aiRecipe of allRecipes) {
+      if (!aiRecipe.id) {
+        recipeErrors.push(`${aiRecipe.name}: missing recipe id`)
+        continue
+      }
+
       // Create new recipe for this meal plan
       const { data: newRecipe, error: recipeError } = await supabase
         .from('recipes')
@@ -73,6 +86,7 @@ export async function createMealPlanFromAI(
           ingredients: aiRecipe.ingredients,
           steps: aiRecipe.steps,
           meal_type: aiRecipe.mealType ? aiRecipe.mealType : null,
+          servings: aiRecipe.servings,
           times_used: 1
         } as RecipeInsert)
         .select()
@@ -86,6 +100,7 @@ export async function createMealPlanFromAI(
 
       if (newRecipe) {
         recipeIds.push(newRecipe.id)
+        recipeIdMap[aiRecipe.id] = newRecipe.id
       }
     }
 
@@ -99,12 +114,39 @@ export async function createMealPlanFromAI(
     }
 
     // 3. Link recipes to meal plan
-    const mealPlanRecipes: MealPlanRecipeInsert[] = recipeIds.map((recipeId, index) => ({
-      meal_plan_id: mealPlan.id,
-      recipe_id: recipeId,
-      // Distribute meals across the week (assuming 7 days)
-      planned_for_date: getDateForMealIndex(weekOf, index)
-    }))
+    let mealPlanRecipes: MealPlanRecipeInsert[] = []
+
+    if (aiResponse.schedule && aiResponse.schedule.length > 0) {
+      mealPlanRecipes = aiResponse.schedule.reduce<MealPlanRecipeInsert[]>((acc, entry, index) => {
+        const linkedRecipeId = recipeIdMap[entry.recipeId]
+
+        if (!linkedRecipeId) {
+          console.warn(`Schedule entry ${index} references missing recipe id ${entry.recipeId}`)
+          return acc
+        }
+
+        const slotLabel = entry.slotLabel || `${entry.day} ${entry.mealType}`
+        const plannedDate = getDateForDayName(weekOf, entry.day)
+
+        acc.push({
+          meal_plan_id: mealPlan.id,
+          recipe_id: linkedRecipeId,
+          planned_for_date: plannedDate,
+          meal_type: entry.mealType ? entry.mealType.toLowerCase() as 'breakfast' | 'lunch' | 'dinner' : undefined,
+          portion_multiplier: entry.portionMultiplier || 1,
+          slot_label: slotLabel
+        })
+
+        return acc
+      }, [])
+    } else {
+      mealPlanRecipes = recipeIds.map((recipeId, index) => ({
+        meal_plan_id: mealPlan.id,
+        recipe_id: recipeId,
+        planned_for_date: getDateForMealIndex(weekOf, index),
+        portion_multiplier: 1
+      }))
+    }
 
     const { error: linkError } = await supabase
       .from('meal_plan_recipes')
@@ -142,11 +184,13 @@ export async function createMealPlanFromAI(
       data: mealPlan
     }
 
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error('Error in createMealPlanFromAI:', error)
     return {
       success: false,
-      error: `An unexpected error occurred: ${error?.message || error}`
+      error: `An unexpected error occurred: ${
+        error instanceof Error ? error.message : String(error)
+      }`
     }
   }
 }
@@ -280,6 +324,41 @@ function getDateForMealIndex(weekOf: string, index: number): string {
   const dayOffset = index % 7 // Distribute meals across 7 days
   const mealDate = new Date(startDate)
   mealDate.setDate(startDate.getDate() + dayOffset)
+  return mealDate.toISOString().split('T')[0]
+}
+
+function getDateForDayName(weekOf: string, dayName?: string): string | undefined {
+  if (!dayName) return undefined
+
+  const normalizedDay = dayName.trim().toLowerCase()
+  const dayMap: Record<string, number> = {
+    sunday: 0,
+    monday: 1,
+    tuesday: 2,
+    wednesday: 3,
+    thursday: 4,
+    friday: 5,
+    saturday: 6
+  }
+
+  const targetOffset = dayMap[normalizedDay]
+
+  if (targetOffset === undefined) {
+    return undefined
+  }
+
+  const startDate = new Date(weekOf)
+  if (Number.isNaN(startDate.getTime())) {
+    return undefined
+  }
+
+  // Assume weekOf is the Monday of the week; adjust to target day
+  const startDayIndex = dayMap[startDate.toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase()] ?? 1
+  const offset = targetOffset - startDayIndex
+
+  const mealDate = new Date(startDate)
+  mealDate.setDate(startDate.getDate() + offset)
+
   return mealDate.toISOString().split('T')[0]
 }
 
